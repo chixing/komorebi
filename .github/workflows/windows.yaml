@@ -49,15 +49,11 @@ jobs:
         run: cargo +${{ env.RUST_VERSION }} test --locked
 
   build:
-    name: Build ${{ matrix.target }}
+    name: Build x86_64
     needs: validate
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - x86_64-pc-windows-msvc
-          - aarch64-pc-windows-msvc
     runs-on: windows-latest
+    env:
+      TARGET: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v6
         with:
@@ -69,24 +65,24 @@ jobs:
         with:
           cache-on-failure: "true"
           cache-all-crates: "true"
-          key: build-${{ matrix.target }}-${{ env.RUST_VERSION }}
+          key: build-${{ env.TARGET }}-${{ env.RUST_VERSION }}
       - uses: houseabsolute/actions-rust-cross@v1
         with:
           command: build
           toolchain: ${{ env.RUST_VERSION }}
-          target: ${{ matrix.target }}
+          target: ${{ env.TARGET }}
           args: --locked --release
       - name: Build MSI
         shell: pwsh
         run: |
           cargo +$Env:RUST_VERSION install cargo-wix --locked
-          cargo +$Env:RUST_VERSION wix --no-build -p komorebi --nocapture -I .\wix\main.wxs --target ${{ matrix.target }}
+          cargo +$Env:RUST_VERSION wix --no-build -p komorebi --nocapture -I .\wix\main.wxs --target $Env:TARGET
       - uses: actions/upload-artifact@v7
         with:
-          name: komorebi-${{ matrix.target }}-${{ github.sha }}
+          name: komorebi-${{ env.TARGET }}-${{ github.sha }}
           path: |
-            target/${{ matrix.target }}/release/*.exe
-            target/${{ matrix.target }}/release/*.pdb
+            target/${{ env.TARGET }}/release/*.exe
+            target/${{ env.TARGET }}/release/*.pdb
             target/wix/komorebi-*.msi
           if-no-files-found: error
           retention-days: 14
@@ -113,10 +109,7 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ steps.version.outputs.version }}"
-          $targets = @(
-            "x86_64-pc-windows-msvc",
-            "aarch64-pc-windows-msvc"
-          )
+          $targets = @("x86_64-pc-windows-msvc")
 
           New-Item -ItemType Directory -Path release -Force | Out-Null
           $checksums = @()
