@@ -2110,19 +2110,12 @@ impl WindowManager {
 
         tracing::info!("focusing container");
 
-        if workspace.monocle_container.is_some() {
-            let cycle_direction = match direction {
-                OperationDirection::Left | OperationDirection::Down => CycleDirection::Previous,
-                OperationDirection::Right | OperationDirection::Up => CycleDirection::Next,
+        let new_idx =
+            if workspace.maximized_window.is_some() || workspace.monocle_container.is_some() {
+                None
+            } else {
+                workspace.new_idx_for_direction(direction)
             };
-            return self.cycle_monocle(cycle_direction);
-        }
-
-        let new_idx = if workspace.maximized_window.is_some() {
-            None
-        } else {
-            workspace.new_idx_for_direction(direction)
-        };
 
         let mut cross_monitor_monocle_or_max = false;
 
@@ -3105,27 +3098,6 @@ impl WindowManager {
         }
 
         workspace.reintegrate_monocle_container()
-    }
-
-    #[tracing::instrument(skip(self))]
-    pub fn cycle_monocle(&mut self, direction: CycleDirection) -> eyre::Result<()> {
-        tracing::info!("cycling monocle container");
-
-        if self.focused_workspace()?.containers().is_empty() {
-            return Ok(());
-        }
-
-        self.focused_workspace_mut()?
-            .cycle_monocle_container(direction)?;
-
-        for container in self.focused_workspace_mut()?.containers_mut() {
-            container.hide(None);
-        }
-
-        // borders were getting funny during cycles, can't be bothered to root cause it
-        border_manager::destroy_all_borders()?;
-
-        self.update_focused_workspace(true, true)
     }
 
     #[tracing::instrument(skip(self))]
@@ -5695,48 +5667,71 @@ mod tests {
     }
 
     #[test]
-    fn test_directional_focus_cycles_monocle_container() {
+    fn test_directional_focus_crosses_monitor_while_monocled() {
         let (mut wm, _context) = setup_window_manager();
 
-        let mut monitor = monitor::new(
+        let mut left_monitor = monitor::new(
             0,
-            Rect::default(),
-            Rect::default(),
+            Rect {
+                left: 0,
+                right: 1920,
+                top: 0,
+                bottom: 1080,
+            },
+            Rect {
+                left: 0,
+                right: 1920,
+                top: 0,
+                bottom: 1080,
+            },
             "TestMonitor".to_string(),
             "TestDevice".to_string(),
             "TestDeviceID".to_string(),
             Some("TestMonitorID".to_string()),
         );
 
-        let workspace = monitor.focused_workspace_mut().unwrap();
+        let mut container = Container::default();
+        container.windows_mut().push_back(Window::from(1));
+        left_monitor
+            .focused_workspace_mut()
+            .unwrap()
+            .add_container_to_back(container);
 
-        for hwnd in [1, 2] {
-            let mut container = Container::default();
-            container.windows_mut().push_back(Window::from(hwnd));
-            workspace.add_container_to_back(container);
-        }
+        let right_monitor = monitor::new(
+            1,
+            Rect {
+                left: 1920,
+                right: 1920,
+                top: 0,
+                bottom: 1080,
+            },
+            Rect {
+                left: 1920,
+                right: 1920,
+                top: 0,
+                bottom: 1080,
+            },
+            "TestMonitor2".to_string(),
+            "TestDevice2".to_string(),
+            "TestDeviceID2".to_string(),
+            Some("TestMonitorID2".to_string()),
+        );
 
-        wm.monitors_mut().push_back(monitor);
+        wm.monitors_mut().push_back(left_monitor);
+        wm.monitors_mut().push_back(right_monitor);
+        wm.focus_monitor(0).unwrap();
         wm.monocle_on().unwrap();
-
-        let initial_monocle_hwnd = {
-            let workspace = wm.focused_workspace().unwrap();
-            let monocle = workspace.monocle_container.as_ref().unwrap();
-            monocle.focused_window().unwrap().hwnd
-        };
 
         let _ = wm.focus_container_in_direction(OperationDirection::Right);
 
-        let workspace = wm.focused_workspace().unwrap();
-        let monocle = workspace.monocle_container.as_ref().unwrap();
-        let container_hwnds = workspace
-            .containers()
-            .iter()
-            .map(|container| container.windows()[0].hwnd)
-            .collect::<Vec<_>>();
-
-        assert_ne!(monocle.focused_window().unwrap().hwnd, initial_monocle_hwnd);
-        assert!(container_hwnds.contains(&initial_monocle_hwnd));
+        assert_eq!(wm.focused_monitor_idx(), 1);
+        assert!(
+            wm.monitors()[0]
+                .focused_workspace()
+                .unwrap()
+                .monocle_container
+                .is_some()
+        );
     }
 
     #[test]
