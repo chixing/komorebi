@@ -94,6 +94,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v8
         with:
+          name: komorebi-x86_64-pc-windows-msvc-${{ github.sha }}
           path: artifacts
       - name: Determine version
         id: version
@@ -115,7 +116,7 @@ jobs:
           $checksums = @()
 
           foreach ($target in $targets) {
-            $artifactRoot = Join-Path "artifacts" "komorebi-$target-${{ github.sha }}"
+            $artifactRoot = "artifacts"
             $releaseRoot = Join-Path $artifactRoot "$target\release"
             $zipName = "komorebi-$version-$target.zip"
             $zipPath = Join-Path "release" $zipName
