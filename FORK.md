@@ -30,11 +30,11 @@ only after the fork-specific behavior and layout modes have been tested.
 
 ## v0.1.41 candidate
 
-The `upgrade/1.41` branch integrates upstream `v0.1.41` while preserving:
+The `upgrade/1.41` branch integrates upstream `v0.1.41` while preserving the
+fork's per-window virtual-desktop isolation.
 
-- the fork's per-window virtual-desktop isolation;
-- the `v0.1.40` monocle behavior, where directional focus commands do not
-  replace the active monocle container.
+It also retains upstream `v0.1.41` monocle cycling: directional focus commands
+replace the active monocle container with the previous or next tiled window.
 
 The installed stable release remains `v0.1.40-desktop-isolation.1` until this
 candidate passes local and hands-on testing.
