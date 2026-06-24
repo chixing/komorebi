@@ -47,7 +47,9 @@ jobs:
           cache-all-crates: "true"
           key: ${{ matrix.platform.target }}
       - run: cargo +nightly fmt --check
-      - run: cargo clippy
+      # Rust 1.96 added these style lints after the v0.1.40 source was released.
+      # Keep all other warnings denied while allowing the frozen source to build.
+      - run: cargo clippy -- -A clippy::collapsible_match -A clippy::unnecessary_sort_by
       - run: cargo test
       - uses: houseabsolute/actions-rust-cross@v1
         with:
