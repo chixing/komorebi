@@ -36,6 +36,27 @@ The release workflow then updates the Scoop manifest in `bucket/`.
 
 The fork does not submit releases to the official Winget package.
 
+## Actions workflow
+
+The Windows workflow uses a staged release pipeline:
+
+1. validate formatting, Clippy, and tests on pinned Rust toolchains;
+2. build x86_64 and ARM64 artifacts independently;
+3. package both architectures and calculate checksums on every run;
+4. publish a GitHub release only for a `v*` tag;
+5. update the Scoop manifest only after the release succeeds.
+
+Pull requests and manual workflow runs are dry runs: they build and package
+artifacts but cannot publish a release or modify the Scoop manifest.
+
+Before merging workflow changes into `main`:
+
+1. run the pinned formatting, Clippy, and test commands locally;
+2. push an isolated `ci/*` branch;
+3. open a pull request to exercise both hosted Windows architectures;
+4. inspect the packaged dry-run artifact;
+5. merge only after all jobs pass.
+
 ## Scoop
 
 Add this repository as a Scoop bucket and install the complete suite:

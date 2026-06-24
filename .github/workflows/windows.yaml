@@ -1,221 +1,227 @@
-# Adapted from https://github.com/rust-lang/rustup/blob/master/.github/workflows/windows-builds-on-master.yaml
-
 name: Windows
 
 on:
   pull_request:
     branches:
-      - "*"
+      - main
   push:
     branches:
       - main
-      - feature/*
-      - hotfix/*
     tags:
-      - v*
-  # schedule:
-  #   - cron: "30 0 * * 0" # Every day at 00:30 UTC
+      - "v*"
   workflow_dispatch:
 
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: "1.96.0"
+  RUSTFMT_VERSION: "nightly-2026-06-23"
+  RUSTFLAGS: "-Ctarget-feature=+crt-static -Dwarnings"
+
 jobs:
-  build:
-    strategy:
-      fail-fast: true
-      matrix:
-        platform:
-          - os-name: Windows-x86_64
-            runs-on: windows-latest
-            target: x86_64-pc-windows-msvc
-          - os-name: Windows-aarch64
-            runs-on: windows-latest
-            target: aarch64-pc-windows-msvc
-    runs-on: ${{ matrix.platform.runs-on }}
-    permissions: write-all
-    env:
-      RUSTFLAGS: -Ctarget-feature=+crt-static -Dwarnings -Aclippy::collapsible_match -Aclippy::unnecessary_sort_by
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-      - run: rustup toolchain install stable --profile minimal
-      - run: rustup component add --toolchain stable-x86_64-pc-windows-msvc clippy
-      - run: rustup toolchain install nightly --allow-downgrade -c rustfmt
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: "true"
-          cache-all-crates: "true"
-          key: ${{ matrix.platform.target }}
-      - run: cargo +nightly fmt --check
-      # Rust 1.96 added two style lints after the v0.1.40 source was released.
-      # RUSTFLAGS keeps all other warnings denied while allowing the frozen source to build.
-      - run: cargo clippy
-      - run: cargo test
-      - uses: houseabsolute/actions-rust-cross@v1
-        with:
-          command: "build"
-          target: ${{ matrix.platform.target }}
-          args: "--locked --release"
-      - run: |
-          cargo install cargo-wix
-          cargo wix --no-build -p komorebi --nocapture -I .\wix\main.wxs --target ${{ matrix.platform.target }}
-      - uses: actions/upload-artifact@v6
-        with:
-          name: komorebi-${{ matrix.platform.target }}-${{ github.sha }}
-          path: |
-            target/${{ matrix.platform.target }}/release/*.exe
-            target/${{ matrix.platform.target }}/release/*.pdb
-            target/wix/komorebi-*.msi
-          retention-days: 14
-
-  nightly:
-    needs: build
+  validate:
+    name: Validate x86_64
     runs-on: windows-latest
-    permissions: write-all
-    if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' ) }}
-    env:
-      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - shell: bash
-        run: echo "VERSION=nightly" >> $GITHUB_ENV
-      - uses: actions/download-artifact@v7
-      - run: |
-          Compress-Archive -Force ./komorebi-x86_64-pc-windows-msvc-${{ github.sha }}/x86_64-pc-windows-msvc/release/*.exe komorebi-$Env:VERSION-x86_64-pc-windows-msvc.zip
-          Copy-Item ./komorebi-x86_64-pc-windows-msvc-${{ github.sha }}/wix/*x86_64.msi -Destination ./komorebi-$Env:VERSION-x86_64.msi
-          echo "$((Get-FileHash komorebi-$Env:VERSION-x86_64-pc-windows-msvc.zip).Hash.ToLower())  komorebi-$Env:VERSION-x86_64-pc-windows-msvc.zip" >checksums.txt
-
-          Compress-Archive -Force ./komorebi-aarch64-pc-windows-msvc-${{ github.sha }}/aarch64-pc-windows-msvc/release/*.exe komorebi-$Env:VERSION-aarch64-pc-windows-msvc.zip
-          Copy-Item ./komorebi-aarch64-pc-windows-msvc-${{ github.sha }}/wix/*aarch64.msi -Destination ./komorebi-$Env:VERSION-aarch64.msi
-          echo "$((Get-FileHash komorebi-$Env:VERSION-aarch64-pc-windows-msvc.zip).Hash.ToLower())  komorebi-$Env:VERSION-aarch64-pc-windows-msvc.zip" >>checksums.txt
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: "true"
-          cache-all-crates: "true"
-      - shell: bash
-        run: |
-          if ! type kokai >/dev/null; then cargo install --locked kokai --force; fi
-          git tag -d nightly || true
-          git tag nightly
-          kokai release --no-emoji --add-links github:commits,issues --ref nightly >"CHANGELOG.md"
-      - shell: bash
-        run: |
-          gh release delete nightly --yes || true
-          git push origin :nightly || true
-          gh release create nightly \
-            --target $GITHUB_SHA \
-            --prerelease \
-            --title "komorebi nightly (${GITHUB_SHA})" \
-            --notes-file CHANGELOG.md \
-            komorebi-nightly-x86_64-pc-windows-msvc.zip \
-            komorebi-nightly-x86_64.msi \
-            komorebi-nightly-aarch64-pc-windows-msvc.zip \
-            komorebi-nightly-aarch64.msi \
-            checksums.txt
-
-  release-dry-run:
-    needs: build
-    runs-on: windows-latest
-    permissions: write-all
-    if: ${{ github.ref == 'refs/heads/main' }}
-    env:
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-      - shell: bash
-        run: |
-          TAG=${{ github.event.release.tag_name }}
-          echo "VERSION=${TAG#v}" >> $GITHUB_ENV
-      - uses: actions/download-artifact@v7
-      - run: |
-          Compress-Archive -Force ./komorebi-x86_64-pc-windows-msvc-${{ github.sha }}/x86_64-pc-windows-msvc/release/*.exe komorebi-$Env:VERSION-x86_64-pc-windows-msvc.zip
-          Copy-Item ./komorebi-x86_64-pc-windows-msvc-${{ github.sha }}/wix/*x86_64.msi -Destination ./komorebi-$Env:VERSION-x86_64.msi
-          echo "$((Get-FileHash komorebi-$Env:VERSION-x86_64-pc-windows-msvc.zip).Hash.ToLower())  komorebi-$Env:VERSION-x86_64-pc-windows-msvc.zip" >checksums.txt
-
-          Compress-Archive -Force ./komorebi-aarch64-pc-windows-msvc-${{ github.sha }}/aarch64-pc-windows-msvc/release/*.exe komorebi-$Env:VERSION-aarch64-pc-windows-msvc.zip
-          Copy-Item ./komorebi-aarch64-pc-windows-msvc-${{ github.sha }}/wix/*aarch64.msi -Destination ./komorebi-$Env:VERSION-aarch64.msi
-          echo "$((Get-FileHash komorebi-$Env:VERSION-aarch64-pc-windows-msvc.zip).Hash.ToLower())  komorebi-$Env:VERSION-aarch64-pc-windows-msvc.zip" >>checksums.txt
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: "true"
-          cache-all-crates: "true"
-      - shell: bash
-        run: |
-          if ! type kokai >/dev/null; then cargo install --locked kokai --force; fi
-          git tag -d nightly || true
-          kokai release --no-emoji --add-links github:commits,issues --ref "${{ github.ref_name }}" >"CHANGELOG.md"
-      - uses: softprops/action-gh-release@v2
-        with:
-          draft: true
-          body_path: "CHANGELOG.md"
-          files: |
-            checksums.txt
-            *.zip
-            *.msi
-
-  release:
-    needs: build
-    runs-on: windows-latest
-    permissions: write-all
-    if: startsWith(github.ref, 'refs/tags/v')
-    env:
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-      - shell: bash
-        run: |
-          TAG=${{ github.ref_name }}
-          echo "VERSION=${TAG#v}" >> $GITHUB_ENV
-      - uses: actions/download-artifact@v7
-      - run: |
-          Compress-Archive -Force ./komorebi-x86_64-pc-windows-msvc-${{ github.sha }}/x86_64-pc-windows-msvc/release/*.exe komorebi-$Env:VERSION-x86_64-pc-windows-msvc.zip
-          Copy-Item ./komorebi-x86_64-pc-windows-msvc-${{ github.sha }}/wix/*x86_64.msi -Destination ./komorebi-$Env:VERSION-x86_64.msi
-          echo "$((Get-FileHash komorebi-$Env:VERSION-x86_64-pc-windows-msvc.zip).Hash.ToLower())  komorebi-$Env:VERSION-x86_64-pc-windows-msvc.zip" >checksums.txt
-
-          Compress-Archive -Force ./komorebi-aarch64-pc-windows-msvc-${{ github.sha }}/aarch64-pc-windows-msvc/release/*.exe komorebi-$Env:VERSION-aarch64-pc-windows-msvc.zip
-          Copy-Item ./komorebi-aarch64-pc-windows-msvc-${{ github.sha }}/wix/*aarch64.msi -Destination ./komorebi-$Env:VERSION-aarch64.msi
-          echo "$((Get-FileHash komorebi-$Env:VERSION-aarch64-pc-windows-msvc.zip).Hash.ToLower())  komorebi-$Env:VERSION-aarch64-pc-windows-msvc.zip" >>checksums.txt
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: "true"
-          cache-all-crates: "true"
-      - shell: bash
-        run: |
-          if ! type kokai >/dev/null; then cargo install --locked kokai --force; fi
-          git tag -d nightly || true
-          kokai release --no-emoji --add-links github:commits,issues --ref "$(git tag --points-at HEAD)" >"CHANGELOG.md"
-      - uses: softprops/action-gh-release@v2
-        with:
-          name: Komorebi ${{ env.VERSION }} — Desktop Isolation
-          body_path: "CHANGELOG.md"
-          files: |
-            checksums.txt
-            *.zip
-            *.msi
-      - name: Update Scoop manifest
+      - name: Install Rust toolchains
         shell: pwsh
         run: |
-          $assetName = "komorebi-$Env:VERSION-x86_64-pc-windows-msvc.zip"
-          $hash = (Get-FileHash -LiteralPath $assetName -Algorithm SHA256).Hash.ToLowerInvariant()
+          rustup toolchain install $Env:RUST_VERSION --profile minimal --component clippy
+          rustup toolchain install $Env:RUSTFMT_VERSION --profile minimal --component rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+          cache-all-crates: "true"
+          key: validate-${{ env.RUST_VERSION }}
+      - name: Check formatting
+        run: cargo +${{ env.RUSTFMT_VERSION }} fmt --check
+      - name: Run Clippy
+        run: cargo +${{ env.RUST_VERSION }} clippy --locked
+      - name: Run tests
+        run: cargo +${{ env.RUST_VERSION }} test --locked
 
-          git fetch origin main
-          git switch main
+  build:
+    name: Build ${{ matrix.target }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - aarch64-pc-windows-msvc
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Install Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install $Env:RUST_VERSION --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+          cache-all-crates: "true"
+          key: build-${{ matrix.target }}-${{ env.RUST_VERSION }}
+      - uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: build
+          toolchain: ${{ env.RUST_VERSION }}
+          target: ${{ matrix.target }}
+          args: --locked --release
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          cargo +$Env:RUST_VERSION install cargo-wix --locked
+          cargo +$Env:RUST_VERSION wix --no-build -p komorebi --nocapture -I .\wix\main.wxs --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: komorebi-${{ matrix.target }}-${{ github.sha }}
+          path: |
+            target/${{ matrix.target }}/release/*.exe
+            target/${{ matrix.target }}/release/*.pdb
+            target/wix/komorebi-*.msi
+          if-no-files-found: error
+          retention-days: 14
+
+  package:
+    name: Package release artifacts
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+      - name: Determine version
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $version = "${{ github.ref_name }}".TrimStart("v")
+          } else {
+            $version = "dry-run-${{ github.sha }}".Substring(0, 20)
+          }
+          "version=$version" >> $Env:GITHUB_OUTPUT
+      - name: Create ZIP files, MSI files, and checksums
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $targets = @(
+            "x86_64-pc-windows-msvc",
+            "aarch64-pc-windows-msvc"
+          )
+
+          New-Item -ItemType Directory -Path release -Force | Out-Null
+          $checksums = @()
+
+          foreach ($target in $targets) {
+            $artifactRoot = Join-Path "artifacts" "komorebi-$target-${{ github.sha }}"
+            $releaseRoot = Join-Path $artifactRoot "$target\release"
+            $zipName = "komorebi-$version-$target.zip"
+            $zipPath = Join-Path "release" $zipName
+
+            Compress-Archive -Force -Path "$releaseRoot\*.exe" -DestinationPath $zipPath
+            $hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            $checksums += "$hash  $zipName"
+
+            $architecture = if ($target.StartsWith("x86_64")) { "x86_64" } else { "aarch64" }
+            $msi = Get-ChildItem -Path (Join-Path $artifactRoot "wix") -Filter "*$architecture.msi" |
+              Select-Object -First 1
+            if (-not $msi) {
+              throw "MSI not found for $target"
+            }
+
+            $msiName = "komorebi-$version-$architecture.msi"
+            Copy-Item -LiteralPath $msi.FullName -Destination (Join-Path "release" $msiName)
+            $msiHash = (Get-FileHash -LiteralPath (Join-Path "release" $msiName) -Algorithm SHA256).Hash.ToLowerInvariant()
+            $checksums += "$msiHash  $msiName"
+          }
+
+          $checksums | Set-Content -LiteralPath "release\checksums.txt" -Encoding ascii
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ github.sha }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-${{ github.sha }}
+          path: release
+      - name: Publish or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = $tag.TrimStart("v")
+          $existing = gh release view $tag --repo "${{ github.repository }}" 2>$null
+
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag release/* --clobber --repo "${{ github.repository }}"
+          } else {
+            gh release create $tag release/* `
+              --repo "${{ github.repository }}" `
+              --target "${{ github.sha }}" `
+              --title "Komorebi $version — Desktop Isolation" `
+              --generate-notes
+          }
+
+  scoop:
+    name: Update Scoop manifest
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: release
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-${{ github.sha }}
+          path: release
+      - name: Update manifest
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          $assetName = "komorebi-$version-x86_64-pc-windows-msvc.zip"
+          $assetPath = Join-Path "release" $assetName
+          $hash = (Get-FileHash -LiteralPath $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
 
           $manifestPath = "bucket/komorebi-desktop-isolation.json"
           $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-          $manifest.version = $Env:VERSION
-          $manifest.architecture.'64bit'.url = "https://github.com/${{ github.repository }}/releases/download/v$Env:VERSION/$assetName"
+          $manifest.version = $version
+          $manifest.architecture.'64bit'.url = "https://github.com/${{ github.repository }}/releases/download/v$version/$assetName"
           $manifest.architecture.'64bit'.hash = $hash
           $manifest | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $manifestPath -Encoding utf8
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add $manifestPath
-          git commit -m "chore(scoop): update manifest for v$Env:VERSION [skip ci]"
+
+          if (git diff --cached --quiet) {
+            Write-Host "Scoop manifest is already current"
+            exit 0
+          }
+
+          git commit -m "chore(scoop): update manifest for v$version [skip ci]"
           git push origin main
