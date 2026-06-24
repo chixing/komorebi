@@ -9,7 +9,7 @@
   "architecture": {
     "64bit": {
       "url": "https://github.com/chixing/komorebi/releases/download/v0.1.40-desktop-isolation.1/komorebi-0.1.40-desktop-isolation.1-x86_64-pc-windows-msvc.zip",
-      "hash": "release-workflow-will-publish-this-hash"
+      "hash": "264dccae1b3295c31de716d1a6f83a260e2587827ec0c01b1c0f7b90a9470067"
     }
   },
   "bin": [
