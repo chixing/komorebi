@@ -16,6 +16,7 @@ use windows::Win32::System::Com::COINIT_MULTITHREADED;
 use windows::Win32::System::Com::CoCreateInstance;
 use windows::Win32::System::Com::CoInitializeEx;
 use windows::Win32::System::Com::CoUninitialize;
+use windows::core::GUID;
 use windows_core::Interface;
 
 struct ComInit();
@@ -61,6 +62,32 @@ fn get_iapplication_view_collection(provider: &IServiceProvider) -> IApplication
         assert!(!obj.is_null());
 
         unsafe { IApplicationViewCollection::from_raw(obj) }
+    })
+}
+
+pub fn virtual_desktop_id(hwnd: HWND) -> Option<Vec<u8>> {
+    COM_INIT.with(|_| {
+        let provider = get_iservice_provider();
+        let view_collection = get_iapplication_view_collection(&provider);
+        let mut view = None;
+
+        if unsafe { view_collection.get_view_for_hwnd(hwnd, &mut view) }.is_err() {
+            return None;
+        }
+
+        let view = view?;
+        let mut desktop_id = GUID::zeroed();
+
+        if unsafe { view.get_virtual_desktop_id(&mut desktop_id) }.is_err() {
+            return None;
+        }
+
+        let mut bytes = Vec::with_capacity(16);
+        bytes.extend_from_slice(&desktop_id.data1.to_le_bytes());
+        bytes.extend_from_slice(&desktop_id.data2.to_le_bytes());
+        bytes.extend_from_slice(&desktop_id.data3.to_le_bytes());
+        bytes.extend_from_slice(&desktop_id.data4);
+        Some(bytes)
     })
 }
 

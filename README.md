@@ -2,6 +2,12 @@
 
 Tiling Window Management for Windows.
 
+> [!NOTE]
+> This public fork tracks upstream komorebi and adds virtual-desktop isolation.
+> Its release tags use names such as `v0.1.40-desktop-isolation.1`.
+> The canonical upstream project remains
+> [LGUG2Z/komorebi](https://github.com/LGUG2Z/komorebi).
+
 <p>
   <a href="https://techforpalestine.org/learn-more">
     <img alt="Tech for Palestine" src="https://badge.techforpalestine.org/default">

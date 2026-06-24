@@ -94,6 +94,39 @@ impl WindowManager {
             return Ok(());
         }
 
+        if let Some(virtual_desktop_id) = &self.virtual_desktop_id
+            && let Some(window_virtual_desktop_id) =
+                crate::com::virtual_desktop_id(event.window().hwnd())
+            && window_virtual_desktop_id != *virtual_desktop_id
+        {
+            let hwnd = event.window().hwnd;
+            let mut removed_managed_window = false;
+
+            for monitor in self.monitors_mut() {
+                for workspace in monitor.workspaces_mut() {
+                    if workspace.contains_window(hwnd) {
+                        workspace.remove_window(hwnd)?;
+                        removed_managed_window = true;
+                    }
+                }
+            }
+
+            if removed_managed_window {
+                tracing::info!(
+                    "removed window {} after it moved to another virtual desktop",
+                    hwnd
+                );
+                self.update_known_hwnds();
+                self.retile_all(true)?;
+            }
+
+            tracing::trace!(
+                "ignoring event for window on virtual desktop {:?}",
+                window_virtual_desktop_id
+            );
+            return Ok(());
+        }
+
         let mut rule_debug = RuleDebug::default();
 
         let should_manage = event.window().should_manage(Some(event), &mut rule_debug)?;
