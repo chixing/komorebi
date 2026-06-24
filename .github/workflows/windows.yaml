@@ -18,14 +18,6 @@ on:
   workflow_dispatch:
 
 jobs:
-  cargo-deny:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-      - uses: EmbarkStudios/cargo-deny-action@v2
-
   build:
     strategy:
       fail-fast: true
