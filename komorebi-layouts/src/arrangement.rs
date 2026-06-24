@@ -141,6 +141,15 @@ impl Arrangement for DefaultLayout {
                     });
                 }
 
+                // Last visible column absorbs any remainder from integer division
+                // so that visible columns tile the full area width without gaps
+                let width_remainder = area.right - column_width * visible_columns;
+                if width_remainder > 0 {
+                    let last_visible_idx =
+                        (first_visible as usize + visible_columns as usize - 1).min(len - 1);
+                    layouts[last_visible_idx].right += width_remainder;
+                }
+
                 let adjustment = calculate_scrolling_adjustment(resize_dimensions);
                 layouts
                     .iter_mut()
@@ -660,6 +669,34 @@ impl Arrangement for DefaultLayout {
                     current_left += width;
                 }
 
+                // Last column absorbs any remainder from integer division
+                // so that columns tile the full area width without gaps
+                let total_width: i32 = col_widths.iter().sum();
+                let width_remainder = area.right - total_width;
+                if width_remainder > 0
+                    && let Some(last) = col_widths.last_mut()
+                {
+                    *last += width_remainder;
+                }
+
+                // Pre-calculate flipped column positions: same widths laid out
+                // in reverse order so that the last column sits at area.left
+                let flipped_col_lefts = if matches!(
+                    layout_flip,
+                    Some(Axis::Horizontal | Axis::HorizontalAndVertical)
+                ) {
+                    let n = num_cols as usize;
+                    let mut flipped = vec![0i32; n];
+                    let mut fl = area.left;
+                    for i in (0..n).rev() {
+                        flipped[i] = fl;
+                        fl += col_widths[i];
+                    }
+                    flipped
+                } else {
+                    vec![]
+                };
+
                 let mut iter = layouts.iter_mut().enumerate().peekable();
 
                 for col in 0..num_cols {
@@ -673,8 +710,10 @@ impl Arrangement for DefaultLayout {
                         remaining_windows / remaining_columns
                     };
 
-                    // Rows within each column are equal height (no row_ratios support for Grid)
-                    let win_height = area.bottom / num_rows_in_this_col;
+                    // Rows within each column: base height from integer division,
+                    // last row absorbs any remainder to cover the full area height
+                    let base_height = area.bottom / num_rows_in_this_col;
+                    let height_remainder = area.bottom - base_height * num_rows_in_this_col;
 
                     let col_idx = col as usize;
                     let win_width = col_widths[col_idx];
@@ -682,25 +721,36 @@ impl Arrangement for DefaultLayout {
 
                     for row in 0..num_rows_in_this_col {
                         if let Some((_idx, win)) = iter.next() {
+                            let is_last_row = row == num_rows_in_this_col - 1;
+                            let win_height = if is_last_row {
+                                base_height + height_remainder
+                            } else {
+                                base_height
+                            };
+
                             let mut left = col_left;
-                            let mut top = area.top + win_height * row;
+                            let mut top = area.top + base_height * row;
 
                             match layout_flip {
                                 Some(Axis::Horizontal) => {
-                                    // Calculate flipped left position
-                                    let flipped_col = (num_cols - 1 - col) as usize;
-                                    left = col_lefts[flipped_col];
+                                    left = flipped_col_lefts[col_idx];
                                 }
                                 Some(Axis::Vertical) => {
-                                    // Calculate flipped top position
-                                    top = area.bottom - win_height * (row + 1) + area.top;
+                                    top = if is_last_row {
+                                        area.top
+                                    } else {
+                                        area.top + area.bottom - base_height * (row + 1)
+                                    };
                                 }
                                 Some(Axis::HorizontalAndVertical) => {
-                                    let flipped_col = (num_cols - 1 - col) as usize;
-                                    left = col_lefts[flipped_col];
-                                    top = area.bottom - win_height * (row + 1) + area.top;
+                                    left = flipped_col_lefts[col_idx];
+                                    top = if is_last_row {
+                                        area.top
+                                    } else {
+                                        area.top + area.bottom - base_height * (row + 1)
+                                    };
                                 }
-                                None => {} // No flip
+                                None => {}
                             }
 
                             win.bottom = win_height;
@@ -934,6 +984,16 @@ fn columns_with_ratios(
         left += right;
     }
 
+    // Last column absorbs any remainder from integer division
+    // so that columns tile the full area width without gaps
+    let total_width: i32 = layouts.iter().map(|r| r.right).sum();
+    let remainder = area.right - total_width;
+    if remainder > 0
+        && let Some(last) = layouts.last_mut()
+    {
+        last.right += remainder;
+    }
+
     layouts
 }
 
@@ -1003,6 +1063,16 @@ fn rows_with_ratios(
         });
 
         top += bottom;
+    }
+
+    // Last row absorbs any remainder from integer division
+    // so that rows tile the full area height without gaps
+    let total_height: i32 = layouts.iter().map(|r| r.bottom).sum();
+    let remainder = area.bottom - total_height;
+    if remainder > 0
+        && let Some(last) = layouts.last_mut()
+    {
+        last.bottom += remainder;
     }
 
     layouts
@@ -1130,46 +1200,32 @@ fn recursive_fibonacci(
     };
 
     #[allow(clippy::cast_possible_truncation)]
-    let primary_width = (area.right as f32 * column_split_ratio) as i32;
-    #[allow(clippy::cast_possible_truncation)]
-    let primary_height = (area.bottom as f32 * row_split_ratio) as i32;
-    #[allow(clippy::cast_possible_truncation)]
     let primary_resized_width = (resized.right as f32 * column_split_ratio) as i32;
     #[allow(clippy::cast_possible_truncation)]
     let primary_resized_height = (resized.bottom as f32 * row_split_ratio) as i32;
-
-    let secondary_width = area.right - primary_width;
-    let secondary_resized_width = resized.right - primary_resized_width;
-    let secondary_resized_height = resized.bottom - primary_resized_height;
 
     let (main_x, alt_x, alt_y, main_y);
 
     if let Some(flip) = layout_flip {
         match flip {
             Axis::Horizontal => {
-                main_x =
-                    resized.left + secondary_width + (secondary_width - secondary_resized_width);
+                main_x = resized.left + (area.right - primary_resized_width);
                 alt_x = resized.left;
 
                 alt_y = resized.top + primary_resized_height;
                 main_y = resized.top;
             }
             Axis::Vertical => {
-                main_y = resized.top
-                    + (area.bottom - primary_height)
-                    + ((area.bottom - primary_height) - secondary_resized_height);
+                main_y = resized.top + (area.bottom - primary_resized_height);
                 alt_y = resized.top;
 
                 main_x = resized.left;
                 alt_x = resized.left + primary_resized_width;
             }
             Axis::HorizontalAndVertical => {
-                main_x =
-                    resized.left + secondary_width + (secondary_width - secondary_resized_width);
+                main_x = resized.left + (area.right - primary_resized_width);
                 alt_x = resized.left;
-                main_y = resized.top
-                    + (area.bottom - primary_height)
-                    + ((area.bottom - primary_height) - secondary_resized_height);
+                main_y = resized.top + (area.bottom - primary_resized_height);
                 alt_y = resized.top;
             }
         }
@@ -1541,657 +1597,5 @@ fn resize_bottom(rect: &mut Rect, resize: i32) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::num::NonZeroUsize;
-
-    // Helper to create a test area
-    fn test_area() -> Rect {
-        Rect {
-            left: 0,
-            top: 0,
-            right: 1000,
-            bottom: 800,
-        }
-    }
-
-    // Helper to create LayoutOptions with column ratios
-    fn layout_options_with_column_ratios(ratios: &[f32]) -> LayoutOptions {
-        let mut arr = [None; MAX_RATIOS];
-        for (i, &r) in ratios.iter().take(MAX_RATIOS).enumerate() {
-            arr[i] = Some(r);
-        }
-        LayoutOptions {
-            scrolling: None,
-            grid: None,
-            column_ratios: Some(arr),
-            row_ratios: None,
-        }
-    }
-
-    // Helper to create LayoutOptions with row ratios
-    fn layout_options_with_row_ratios(ratios: &[f32]) -> LayoutOptions {
-        let mut arr = [None; MAX_RATIOS];
-        for (i, &r) in ratios.iter().take(MAX_RATIOS).enumerate() {
-            arr[i] = Some(r);
-        }
-        LayoutOptions {
-            scrolling: None,
-            grid: None,
-            column_ratios: None,
-            row_ratios: Some(arr),
-        }
-    }
-
-    // Helper to create LayoutOptions with both column and row ratios
-    fn layout_options_with_ratios(column_ratios: &[f32], row_ratios: &[f32]) -> LayoutOptions {
-        let mut col_arr = [None; MAX_RATIOS];
-        for (i, &r) in column_ratios.iter().take(MAX_RATIOS).enumerate() {
-            col_arr[i] = Some(r);
-        }
-        let mut row_arr = [None; MAX_RATIOS];
-        for (i, &r) in row_ratios.iter().take(MAX_RATIOS).enumerate() {
-            row_arr[i] = Some(r);
-        }
-        LayoutOptions {
-            scrolling: None,
-            grid: None,
-            column_ratios: Some(col_arr),
-            row_ratios: Some(row_arr),
-        }
-    }
-
-    mod columns_with_ratios_tests {
-        use super::*;
-
-        #[test]
-        fn test_columns_equal_width_no_ratios() {
-            let area = test_area();
-            let layouts = columns_with_ratios(&area, 4, None);
-
-            assert_eq!(layouts.len(), 4);
-            // Each column should be 250 pixels wide (1000 / 4)
-            for layout in &layouts {
-                assert_eq!(layout.right, 250);
-                assert_eq!(layout.bottom, 800);
-            }
-        }
-
-        #[test]
-        fn test_columns_with_single_ratio() {
-            let area = test_area();
-            let opts = layout_options_with_column_ratios(&[0.3]);
-            let layouts = columns_with_ratios(&area, 3, opts.column_ratios);
-
-            assert_eq!(layouts.len(), 3);
-            // First column: 30% of 1000 = 300
-            assert_eq!(layouts[0].right, 300);
-            // Remaining 700 split between 2 columns = 350 each
-            assert_eq!(layouts[1].right, 350);
-            assert_eq!(layouts[2].right, 350);
-        }
-
-        #[test]
-        fn test_columns_with_multiple_ratios() {
-            let area = test_area();
-            let opts = layout_options_with_column_ratios(&[0.2, 0.3, 0.5]);
-            let layouts = columns_with_ratios(&area, 4, opts.column_ratios);
-
-            assert_eq!(layouts.len(), 4);
-            // First column: 20% of 1000 = 200
-            assert_eq!(layouts[0].right, 200);
-            // Second column: 30% of 1000 = 300
-            assert_eq!(layouts[1].right, 300);
-            // Third column: 50% of 1000 = 500
-            // But wait - cumulative is 1.0, so third might be truncated
-            // Let's check what actually happens
-            // Actually, the sum 0.2 + 0.3 = 0.5 < 1.0, and 0.5 + 0.5 = 1.0
-            // So 0.5 won't be included because cumulative would reach 1.0
-        }
-
-        #[test]
-        fn test_columns_positions_are_correct() {
-            let area = test_area();
-            let opts = layout_options_with_column_ratios(&[0.3, 0.4]);
-            let layouts = columns_with_ratios(&area, 3, opts.column_ratios);
-
-            // First column starts at 0
-            assert_eq!(layouts[0].left, 0);
-            // Second column starts where first ends
-            assert_eq!(layouts[1].left, layouts[0].right);
-            // Third column starts where second ends
-            assert_eq!(layouts[2].left, layouts[1].left + layouts[1].right);
-        }
-
-        #[test]
-        fn test_columns_last_column_gets_remaining_space() {
-            let area = test_area();
-            let opts = layout_options_with_column_ratios(&[0.3]);
-            let layouts = columns_with_ratios(&area, 2, opts.column_ratios);
-
-            assert_eq!(layouts.len(), 2);
-            // First column: 30% = 300
-            assert_eq!(layouts[0].right, 300);
-            // Last column gets remaining space: 700
-            assert_eq!(layouts[1].right, 700);
-        }
-
-        #[test]
-        fn test_columns_single_column() {
-            let area = test_area();
-            let opts = layout_options_with_column_ratios(&[0.5]);
-            let layouts = columns_with_ratios(&area, 1, opts.column_ratios);
-
-            assert_eq!(layouts.len(), 1);
-            // Single column takes full width regardless of ratio
-            assert_eq!(layouts[0].right, 1000);
-        }
-
-        #[test]
-        fn test_columns_more_columns_than_ratios() {
-            let area = test_area();
-            let opts = layout_options_with_column_ratios(&[0.2]);
-            let layouts = columns_with_ratios(&area, 5, opts.column_ratios);
-
-            assert_eq!(layouts.len(), 5);
-            // First column: 20% = 200
-            assert_eq!(layouts[0].right, 200);
-            // Remaining 800 split among 4 columns = 200 each
-            for i in 1..5 {
-                assert_eq!(layouts[i].right, 200);
-            }
-        }
-    }
-
-    mod rows_with_ratios_tests {
-        use super::*;
-
-        #[test]
-        fn test_rows_equal_height_no_ratios() {
-            let area = test_area();
-            let layouts = rows_with_ratios(&area, 4, None);
-
-            assert_eq!(layouts.len(), 4);
-            // Each row should be 200 pixels tall (800 / 4)
-            for layout in &layouts {
-                assert_eq!(layout.bottom, 200);
-                assert_eq!(layout.right, 1000);
-            }
-        }
-
-        #[test]
-        fn test_rows_with_single_ratio() {
-            let area = test_area();
-            let opts = layout_options_with_row_ratios(&[0.5]);
-            let layouts = rows_with_ratios(&area, 3, opts.row_ratios);
-
-            assert_eq!(layouts.len(), 3);
-            // First row: 50% of 800 = 400
-            assert_eq!(layouts[0].bottom, 400);
-            // Remaining 400 split between 2 rows = 200 each
-            assert_eq!(layouts[1].bottom, 200);
-            assert_eq!(layouts[2].bottom, 200);
-        }
-
-        #[test]
-        fn test_rows_positions_are_correct() {
-            let area = test_area();
-            let opts = layout_options_with_row_ratios(&[0.25, 0.25]);
-            let layouts = rows_with_ratios(&area, 3, opts.row_ratios);
-
-            // First row starts at top
-            assert_eq!(layouts[0].top, 0);
-            // Second row starts where first ends
-            assert_eq!(layouts[1].top, layouts[0].bottom);
-            // Third row starts where second ends
-            assert_eq!(layouts[2].top, layouts[1].top + layouts[1].bottom);
-        }
-
-        #[test]
-        fn test_rows_last_row_gets_remaining_space() {
-            let area = test_area();
-            let opts = layout_options_with_row_ratios(&[0.25]);
-            let layouts = rows_with_ratios(&area, 2, opts.row_ratios);
-
-            assert_eq!(layouts.len(), 2);
-            // First row: 25% of 800 = 200
-            assert_eq!(layouts[0].bottom, 200);
-            // Last row gets remaining: 600
-            assert_eq!(layouts[1].bottom, 600);
-        }
-    }
-
-    mod vertical_stack_layout_tests {
-        use super::*;
-
-        #[test]
-        fn test_vertical_stack_default_ratio() {
-            let area = test_area();
-            let len = NonZeroUsize::new(3).unwrap();
-            let layouts =
-                DefaultLayout::VerticalStack.calculate(&area, len, None, None, &[], 0, None, &[]);
-
-            assert_eq!(layouts.len(), 3);
-            // Primary column should be 50% (default ratio)
-            assert_eq!(layouts[0].right, 500);
-        }
-
-        #[test]
-        fn test_vertical_stack_custom_ratio() {
-            let area = test_area();
-            let len = NonZeroUsize::new(3).unwrap();
-            let opts = layout_options_with_column_ratios(&[0.7]);
-            let layouts = DefaultLayout::VerticalStack.calculate(
-                &area,
-                len,
-                None,
-                None,
-                &[],
-                0,
-                Some(opts),
-                &[],
-            );
-
-            assert_eq!(layouts.len(), 3);
-            // Primary column should be 70%
-            assert_eq!(layouts[0].right, 700);
-            // Stack columns should share remaining 30%
-            assert_eq!(layouts[1].right, 300);
-            assert_eq!(layouts[2].right, 300);
-        }
-
-        #[test]
-        fn test_vertical_stack_with_row_ratios() {
-            let area = test_area();
-            let len = NonZeroUsize::new(4).unwrap();
-            let opts = layout_options_with_ratios(&[0.6], &[0.5, 0.3]);
-            let layouts = DefaultLayout::VerticalStack.calculate(
-                &area,
-                len,
-                None,
-                None,
-                &[],
-                0,
-                Some(opts),
-                &[],
-            );
-
-            assert_eq!(layouts.len(), 4);
-            // Primary column: 60%
-            assert_eq!(layouts[0].right, 600);
-            // Stack rows should use row_ratios
-            // First stack row: 50% of 800 = 400
-            assert_eq!(layouts[1].bottom, 400);
-            // Second stack row: 30% of 800 = 240
-            assert_eq!(layouts[2].bottom, 240);
-        }
-
-        #[test]
-        fn test_vertical_stack_single_window() {
-            let area = test_area();
-            let len = NonZeroUsize::new(1).unwrap();
-            let opts = layout_options_with_column_ratios(&[0.6]);
-            let layouts = DefaultLayout::VerticalStack.calculate(
-                &area,
-                len,
-                None,
-                None,
-                &[],
-                0,
-                Some(opts),
-                &[],
-            );
-
-            assert_eq!(layouts.len(), 1);
-            // Single window should take full width
-            assert_eq!(layouts[0].right, 1000);
-        }
-    }
-
-    mod horizontal_stack_layout_tests {
-        use super::*;
-
-        #[test]
-        fn test_horizontal_stack_default_ratio() {
-            let area = test_area();
-            let len = NonZeroUsize::new(3).unwrap();
-            let layouts =
-                DefaultLayout::HorizontalStack.calculate(&area, len, None, None, &[], 0, None, &[]);
-
-            assert_eq!(layouts.len(), 3);
-            // Primary row should be 50% height (default ratio)
-            assert_eq!(layouts[0].bottom, 400);
-        }
-
-        #[test]
-        fn test_horizontal_stack_custom_ratio() {
-            let area = test_area();
-            let len = NonZeroUsize::new(3).unwrap();
-            let opts = layout_options_with_row_ratios(&[0.7]);
-            let layouts = DefaultLayout::HorizontalStack.calculate(
-                &area,
-                len,
-                None,
-                None,
-                &[],
-                0,
-                Some(opts),
-                &[],
-            );
-
-            assert_eq!(layouts.len(), 3);
-            // Primary row should be 70% height
-            assert_eq!(layouts[0].bottom, 560);
-        }
-    }
-
-    mod ultrawide_layout_tests {
-        use super::*;
-
-        #[test]
-        fn test_ultrawide_default_ratios() {
-            let area = test_area();
-            let len = NonZeroUsize::new(3).unwrap();
-            let layouts = DefaultLayout::UltrawideVerticalStack.calculate(
-                &area,
-                len,
-                None,
-                None,
-                &[],
-                0,
-                None,
-                &[],
-            );
-
-            assert_eq!(layouts.len(), 3);
-            // Primary (center): 50% = 500
-            assert_eq!(layouts[0].right, 500);
-            // Secondary (left): 25% = 250
-            assert_eq!(layouts[1].right, 250);
-            // Tertiary gets remaining: 250
-            assert_eq!(layouts[2].right, 250);
-        }
-
-        #[test]
-        fn test_ultrawide_custom_ratios() {
-            let area = test_area();
-            let len = NonZeroUsize::new(4).unwrap();
-            let opts = layout_options_with_column_ratios(&[0.5, 0.2]);
-            let layouts = DefaultLayout::UltrawideVerticalStack.calculate(
-                &area,
-                len,
-                None,
-                None,
-                &[],
-                0,
-                Some(opts),
-                &[],
-            );
-
-            assert_eq!(layouts.len(), 4);
-            // Primary (center): 50% = 500
-            assert_eq!(layouts[0].right, 500);
-            // Secondary (left): 20% = 200
-            assert_eq!(layouts[1].right, 200);
-            // Tertiary column gets remaining: 300
-            assert_eq!(layouts[2].right, 300);
-            assert_eq!(layouts[3].right, 300);
-        }
-
-        #[test]
-        fn test_ultrawide_two_windows() {
-            let area = test_area();
-            let len = NonZeroUsize::new(2).unwrap();
-            let opts = layout_options_with_column_ratios(&[0.6]);
-            let layouts = DefaultLayout::UltrawideVerticalStack.calculate(
-                &area,
-                len,
-                None,
-                None,
-                &[],
-                0,
-                Some(opts),
-                &[],
-            );
-
-            assert_eq!(layouts.len(), 2);
-            // Primary: 60% = 600
-            assert_eq!(layouts[0].right, 600);
-            // Secondary gets remaining: 400
-            assert_eq!(layouts[1].right, 400);
-        }
-    }
-
-    mod bsp_layout_tests {
-        use super::*;
-
-        #[test]
-        fn test_bsp_default_ratio() {
-            let area = test_area();
-            let len = NonZeroUsize::new(2).unwrap();
-            let layouts = DefaultLayout::BSP.calculate(&area, len, None, None, &[], 0, None, &[]);
-
-            assert_eq!(layouts.len(), 2);
-            // First window should be 50% width
-            assert_eq!(layouts[0].right, 500);
-        }
-
-        #[test]
-        fn test_bsp_custom_column_ratio() {
-            let area = test_area();
-            let len = NonZeroUsize::new(2).unwrap();
-            let opts = layout_options_with_column_ratios(&[0.7]);
-            let layouts =
-                DefaultLayout::BSP.calculate(&area, len, None, None, &[], 0, Some(opts), &[]);
-
-            assert_eq!(layouts.len(), 2);
-            // First window should be 70% width
-            assert_eq!(layouts[0].right, 700);
-        }
-
-        #[test]
-        fn test_bsp_custom_row_ratio() {
-            let area = test_area();
-            let len = NonZeroUsize::new(3).unwrap();
-            let opts = layout_options_with_ratios(&[0.5], &[0.7]);
-            let layouts =
-                DefaultLayout::BSP.calculate(&area, len, None, None, &[], 0, Some(opts), &[]);
-
-            assert_eq!(layouts.len(), 3);
-            // Second window should be 70% of remaining height
-            assert_eq!(layouts[1].bottom, 560);
-        }
-    }
-
-    mod right_main_vertical_stack_tests {
-        use super::*;
-
-        #[test]
-        fn test_right_main_default_ratio() {
-            let area = test_area();
-            let len = NonZeroUsize::new(3).unwrap();
-            let layouts = DefaultLayout::RightMainVerticalStack.calculate(
-                &area,
-                len,
-                None,
-                None,
-                &[],
-                0,
-                None,
-                &[],
-            );
-
-            assert_eq!(layouts.len(), 3);
-            // Primary should be on the right, 50% width
-            assert_eq!(layouts[0].right, 500);
-            assert_eq!(layouts[0].left, 500); // Right side
-        }
-
-        #[test]
-        fn test_right_main_custom_ratio() {
-            let area = test_area();
-            let len = NonZeroUsize::new(3).unwrap();
-            let opts = layout_options_with_column_ratios(&[0.6]);
-            let layouts = DefaultLayout::RightMainVerticalStack.calculate(
-                &area,
-                len,
-                None,
-                None,
-                &[],
-                0,
-                Some(opts),
-                &[],
-            );
-
-            assert_eq!(layouts.len(), 3);
-            // Primary: 60% = 600
-            assert_eq!(layouts[0].right, 600);
-            // Should be positioned on the right
-            assert_eq!(layouts[0].left, 400);
-        }
-    }
-
-    mod columns_layout_tests {
-        use super::*;
-
-        #[test]
-        fn test_columns_layout_with_ratios() {
-            let area = test_area();
-            let len = NonZeroUsize::new(3).unwrap();
-            let opts = layout_options_with_column_ratios(&[0.2, 0.5]);
-            let layouts =
-                DefaultLayout::Columns.calculate(&area, len, None, None, &[], 0, Some(opts), &[]);
-
-            assert_eq!(layouts.len(), 3);
-            assert_eq!(layouts[0].right, 200); // 20%
-            assert_eq!(layouts[1].right, 500); // 50%
-            assert_eq!(layouts[2].right, 300); // remaining
-        }
-    }
-
-    mod rows_layout_tests {
-        use super::*;
-
-        #[test]
-        fn test_rows_layout_with_ratios() {
-            let area = test_area();
-            let len = NonZeroUsize::new(3).unwrap();
-            let opts = layout_options_with_row_ratios(&[0.25, 0.5]);
-            let layouts =
-                DefaultLayout::Rows.calculate(&area, len, None, None, &[], 0, Some(opts), &[]);
-
-            assert_eq!(layouts.len(), 3);
-            assert_eq!(layouts[0].bottom, 200); // 25%
-            assert_eq!(layouts[1].bottom, 400); // 50%
-            assert_eq!(layouts[2].bottom, 200); // remaining
-        }
-    }
-
-    mod grid_layout_tests {
-        use super::*;
-
-        #[test]
-        fn test_grid_with_column_ratios() {
-            let area = test_area();
-            let len = NonZeroUsize::new(4).unwrap();
-            let opts = layout_options_with_column_ratios(&[0.3]);
-            let layouts =
-                DefaultLayout::Grid.calculate(&area, len, None, None, &[], 0, Some(opts), &[]);
-
-            assert_eq!(layouts.len(), 4);
-            // Grid with 4 windows should be 2x2
-            // First column: 30% = 300
-            assert_eq!(layouts[0].right, 300);
-            assert_eq!(layouts[1].right, 300);
-        }
-
-        #[test]
-        fn test_grid_without_ratios() {
-            let area = test_area();
-            let len = NonZeroUsize::new(4).unwrap();
-            let layouts = DefaultLayout::Grid.calculate(&area, len, None, None, &[], 0, None, &[]);
-
-            assert_eq!(layouts.len(), 4);
-            // 2x2 grid, equal columns = 500 each
-            assert_eq!(layouts[0].right, 500);
-            assert_eq!(layouts[2].right, 500);
-        }
-    }
-
-    mod layout_flip_tests {
-        use super::*;
-
-        #[test]
-        fn test_columns_flip_horizontal() {
-            let area = test_area();
-            let len = NonZeroUsize::new(3).unwrap();
-            let opts = layout_options_with_column_ratios(&[0.2, 0.3]);
-            let layouts = DefaultLayout::Columns.calculate(
-                &area,
-                len,
-                None,
-                Some(Axis::Horizontal),
-                &[],
-                0,
-                Some(opts),
-                &[],
-            );
-
-            assert_eq!(layouts.len(), 3);
-            // Columns should be reversed
-            // Last column (originally 50%) should now be first
-            assert_eq!(layouts[2].left, 0);
-        }
-
-        #[test]
-        fn test_rows_flip_vertical() {
-            let area = test_area();
-            let len = NonZeroUsize::new(3).unwrap();
-            let opts = layout_options_with_row_ratios(&[0.25, 0.5]);
-            let layouts = DefaultLayout::Rows.calculate(
-                &area,
-                len,
-                None,
-                Some(Axis::Vertical),
-                &[],
-                0,
-                Some(opts),
-                &[],
-            );
-
-            assert_eq!(layouts.len(), 3);
-            // Rows should be reversed
-            // Last row should now be at top
-            assert_eq!(layouts[2].top, 0);
-        }
-    }
-
-    mod container_padding_tests {
-        use super::*;
-
-        #[test]
-        fn test_padding_applied_to_all_layouts() {
-            let area = test_area();
-            let len = NonZeroUsize::new(2).unwrap();
-            let padding = 10;
-            let layouts = DefaultLayout::Columns.calculate(
-                &area,
-                len,
-                Some(padding),
-                None,
-                &[],
-                0,
-                None,
-                &[],
-            );
-
-            assert_eq!(layouts.len(), 2);
-            // Each layout should have padding applied
-            // left increases, right decreases, top increases, bottom decreases
-            assert_eq!(layouts[0].left, padding);
-            assert_eq!(layouts[0].top, padding);
-            assert_eq!(layouts[0].right, 500 - padding * 2);
-            assert_eq!(layouts[0].bottom, 800 - padding * 2);
-        }
-    }
-}
+#[path = "arrangement_tests.rs"]
+mod tests;

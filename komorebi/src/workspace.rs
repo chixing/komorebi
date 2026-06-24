@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::fmt::Display;
@@ -25,6 +26,7 @@ use crate::core::CustomLayout;
 use crate::core::CycleDirection;
 use crate::core::DefaultLayout;
 use crate::core::Layout;
+use crate::core::LayoutDefaultEntry;
 use crate::core::LayoutOptions;
 use crate::core::OperationDirection;
 use crate::core::Rect;
@@ -61,6 +63,15 @@ pub struct Workspace {
     pub layout: Layout,
     pub layout_options: Option<LayoutOptions>,
     pub layout_rules: Vec<(usize, Layout)>,
+    /// Threshold-based layout options rules (container_count >= threshold -> use these options).
+    /// Sorted by threshold ascending at load time.
+    #[serde(default)]
+    pub layout_options_rules: Vec<(usize, LayoutOptions)>,
+    /// Cached per-layout defaults from the global `layout_defaults` config setting.
+    /// Pre-sorted at config load time; used as fallback when workspace has no overrides.
+    #[serde(skip)]
+    pub(crate) layout_defaults_cache: HashMap<DefaultLayout, CachedLayoutDefault>,
+    pub work_area_offset_rules: Vec<(usize, Rect)>,
     pub layout_flip: Option<Axis>,
     pub workspace_padding: Option<i32>,
     pub container_padding: Option<i32>,
@@ -118,6 +129,9 @@ impl Default for Workspace {
             layout: Layout::Default(DefaultLayout::BSP),
             layout_options: None,
             layout_rules: vec![],
+            layout_options_rules: vec![],
+            layout_defaults_cache: HashMap::new(),
+            work_area_offset_rules: vec![],
             layout_flip: None,
             workspace_padding: Option::from(DEFAULT_WORKSPACE_PADDING.load(Ordering::SeqCst)),
             container_padding: Option::from(DEFAULT_CONTAINER_PADDING.load(Ordering::SeqCst)),
@@ -163,8 +177,49 @@ pub struct WorkspaceGlobals {
     pub floating_layer_behaviour: Option<FloatingLayerBehaviour>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Cached per-layout default options (pre-sorted rules) derived from the global `layout_defaults`.
+pub(crate) struct CachedLayoutDefault {
+    pub layout_options: Option<LayoutOptions>,
+    /// Threshold-based rules, sorted by threshold ascending at load time
+    pub layout_options_rules: Vec<(usize, LayoutOptions)>,
+}
+
+/// Convert an optional HashMap of threshold-based layout options rules into a Vec sorted by
+/// threshold ascending.
+fn sorted_layout_options_rules(
+    rules: Option<&HashMap<usize, LayoutOptions>>,
+) -> Vec<(usize, LayoutOptions)> {
+    match rules {
+        Some(rules) => {
+            let mut sorted: Vec<(usize, LayoutOptions)> =
+                rules.iter().map(|(t, o)| (*t, *o)).collect();
+            sorted.sort_by_key(|(t, _)| *t);
+            sorted
+        }
+        None => vec![],
+    }
+}
+
+/// Find the highest matching threshold rule for the given container count.
+/// Rules must be sorted by threshold ascending.
+fn resolve_threshold_match(
+    rules: &[(usize, LayoutOptions)],
+    container_count: usize,
+) -> Option<LayoutOptions> {
+    rules
+        .iter()
+        .rev()
+        .find(|(threshold, _)| container_count >= *threshold)
+        .map(|(_, opts)| *opts)
+}
+
 impl Workspace {
-    pub fn load_static_config(&mut self, config: &WorkspaceConfig) -> eyre::Result<()> {
+    pub fn load_static_config(
+        &mut self,
+        config: &WorkspaceConfig,
+        layout_defaults: Option<&HashMap<DefaultLayout, LayoutDefaultEntry>>,
+    ) -> eyre::Result<()> {
         self.name = Option::from(config.name.clone());
 
         self.container_padding = config.container_padding;
@@ -213,6 +268,15 @@ impl Workspace {
             self.layout_rules = all_layout_rules;
         }
 
+        let mut all_work_area_offset_rules = vec![];
+        if let Some(work_area_offset_rules) = &config.work_area_offset_rules {
+            for (count, rect) in work_area_offset_rules {
+                all_work_area_offset_rules.push((*count, *rect));
+            }
+            all_work_area_offset_rules.sort_by_key(|(i, _)| *i);
+            self.work_area_offset_rules = all_work_area_offset_rules;
+        }
+
         self.work_area_offset = config.work_area_offset;
 
         self.apply_window_based_work_area_offset =
@@ -240,17 +304,76 @@ impl Workspace {
         self.layout_flip = config.layout_flip;
         self.floating_layer_behaviour = config.floating_layer_behaviour;
         self.wallpaper = config.wallpaper.clone();
+
+        // Load layout options directly (LayoutOptions is used in both config and runtime)
         self.layout_options = config.layout_options;
 
+        // Load threshold-based layout options rules, sorted by threshold ascending
+        self.layout_options_rules =
+            sorted_layout_options_rules(config.layout_options_rules.as_ref());
+
         tracing::debug!(
-            "Workspace '{}' loaded layout_options: {:?}",
+            "Workspace '{}' loaded layout_options: {:?}, layout_options_rules: {} entries",
             self.name.as_deref().unwrap_or("unnamed"),
-            self.layout_options
+            self.layout_options,
+            self.layout_options_rules.len(),
         );
+
+        // Cache per-layout defaults from global layout_defaults, pre-sorting rules
+        self.layout_defaults_cache = if let Some(defaults) = layout_defaults {
+            defaults
+                .iter()
+                .map(|(layout, entry)| {
+                    (
+                        *layout,
+                        CachedLayoutDefault {
+                            layout_options: entry.layout_options,
+                            layout_options_rules: sorted_layout_options_rules(
+                                entry.layout_options_rules.as_ref(),
+                            ),
+                        },
+                    )
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
 
         self.workspace_config = Some(config.clone());
 
         Ok(())
+    }
+
+    /// Compute effective layout options using the complete-replacement cascade:
+    ///
+    /// If the workspace defines EITHER `layout_options` OR `layout_options_rules`,
+    /// it completely replaces the global `layout_defaults` for this layout.
+    /// Global defaults are only used when the workspace has NEITHER setting.
+    ///
+    /// Within the effective source (workspace or global):
+    ///   1. Try threshold match from rules (highest matching threshold wins)
+    ///   2. If a rule matches -> use it (full replacement of base)
+    ///   3. Else -> use the base `layout_options`
+    fn effective_layout_options(&self) -> Option<LayoutOptions> {
+        let container_count = self.containers().len();
+
+        let has_workspace_overrides =
+            self.layout_options.is_some() || !self.layout_options_rules.is_empty();
+
+        let (effective_base, effective_rules): (Option<LayoutOptions>, &[(usize, LayoutOptions)]) =
+            if has_workspace_overrides {
+                (self.layout_options, &self.layout_options_rules)
+            } else {
+                match &self.layout {
+                    Layout::Default(dl) => match self.layout_defaults_cache.get(dl) {
+                        Some(entry) => (entry.layout_options, &entry.layout_options_rules),
+                        None => (None, &[]),
+                    },
+                    Layout::Custom(_) => (None, &[]),
+                }
+            };
+
+        resolve_threshold_match(effective_rules, container_count).or(effective_base)
     }
 
     pub fn hide(&mut self, omit: Option<isize>) {
@@ -479,9 +602,27 @@ impl Workspace {
         let border_width = self.globals.border_width;
         let border_offset = self.globals.border_offset;
         let work_area = self.globals.work_area;
-        let work_area_offset = self.work_area_offset.or(self.globals.work_area_offset);
         let window_based_work_area_offset = self.globals.window_based_work_area_offset;
         let window_based_work_area_offset_limit = self.globals.window_based_work_area_offset_limit;
+        let mut rules_work_area_offset = None;
+
+        if !self.work_area_offset_rules.is_empty() {
+            let count = if self.monocle_container.is_some() {
+                1
+            } else {
+                self.containers().len()
+            };
+
+            for (threshold, work_area_offset_rule) in &self.work_area_offset_rules {
+                if count >= *threshold {
+                    rules_work_area_offset = Some(*work_area_offset_rule);
+                }
+            }
+        };
+
+        let work_area_offset = rules_work_area_offset
+            .or(self.work_area_offset)
+            .or(self.globals.work_area_offset);
 
         let mut adjusted_work_area = work_area_offset.map_or_else(
             || work_area,
@@ -495,7 +636,6 @@ impl Workspace {
                 with_offset
             },
         );
-
         if (self.containers().len() <= window_based_work_area_offset_limit as usize
             || self.monocle_container.is_some() && window_based_work_area_offset_limit > 0)
             && self.apply_window_based_work_area_offset
@@ -556,10 +696,14 @@ impl Workspace {
             } else if let Some(window) = &mut self.maximized_window {
                 window.maximize();
             } else if !self.containers().is_empty() {
+                let effective_layout_options = self.effective_layout_options();
+
                 tracing::debug!(
-                    "Workspace '{}' update() - self.layout_options before calculate: {:?}",
+                    "Workspace '{}' update() - effective_layout_options: {:?} (base: {:?}, rules: {})",
                     self.name.as_deref().unwrap_or("unnamed"),
-                    self.layout_options
+                    effective_layout_options,
+                    self.layout_options,
+                    self.layout_options_rules.len(),
                 );
                 let mut layouts = self.layout.as_boxed_arrangement().calculate(
                     &adjusted_work_area,
@@ -570,7 +714,7 @@ impl Workspace {
                     self.layout_flip,
                     &self.resize_dimensions,
                     self.focused_container_idx(),
-                    self.layout_options,
+                    effective_layout_options,
                     &self.latest_layout,
                 );
 

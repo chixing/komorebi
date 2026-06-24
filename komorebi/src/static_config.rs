@@ -13,6 +13,7 @@ use crate::FloatingLayerBehaviour;
 use crate::HIDING_BEHAVIOUR;
 use crate::IGNORE_IDENTIFIERS;
 use crate::LAYERED_WHITELIST;
+use crate::LAYOUT_DEFAULTS;
 use crate::MANAGE_IDENTIFIERS;
 use crate::MONITOR_INDEX_PREFERENCES;
 use crate::NO_TITLEBAR;
@@ -53,6 +54,7 @@ use crate::core::DefaultLayout;
 use crate::core::FocusFollowsMouseImplementation;
 use crate::core::HidingBehaviour;
 use crate::core::Layout;
+use crate::core::LayoutDefaultEntry;
 use crate::core::LayoutOptions;
 use crate::core::MoveBehaviour;
 use crate::core::OperationBehaviour;
@@ -215,6 +217,12 @@ pub struct WorkspaceConfig {
     /// Layout-specific options
     #[serde(skip_serializing_if = "Option::is_none")]
     pub layout_options: Option<LayoutOptions>,
+    /// Threshold-based layout options rules in the format of threshold => options.
+    /// When container count >= threshold, the highest matching threshold's options
+    /// fully replace the base `layout_options`.
+    /// This follows the same threshold logic as `layout_rules`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout_options_rules: Option<HashMap<usize, LayoutOptions>>,
     /// END OF LIFE FEATURE: Custom Layout
     #[deprecated(note = "End of life feature")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -223,6 +231,9 @@ pub struct WorkspaceConfig {
     /// Layout rules in the format of threshold => layout
     #[serde(skip_serializing_if = "Option::is_none")]
     pub layout_rules: Option<HashMap<usize, DefaultLayout>>,
+    /// Work area offset rules in the format of threshold => Rect (default: None)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_area_offset_rules: Option<HashMap<usize, Rect>>,
     /// END OF LIFE FEATURE: Custom layout rules
     #[deprecated(note = "End of life feature")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -287,6 +298,13 @@ impl From<&Workspace> for WorkspaceConfig {
         }
         let layout_rules = (!layout_rules.is_empty()).then_some(layout_rules);
 
+        let mut work_area_offset_rules = HashMap::new();
+        for (threshold, offset) in &value.work_area_offset_rules {
+            work_area_offset_rules.insert(*threshold, *offset);
+        }
+        let work_area_offset_rules =
+            (!work_area_offset_rules.is_empty()).then_some(work_area_offset_rules);
+
         let mut window_container_behaviour_rules = HashMap::new();
         for (threshold, behaviour) in value.window_container_behaviour_rules.iter().flatten() {
             window_container_behaviour_rules.insert(*threshold, *behaviour);
@@ -332,6 +350,11 @@ impl From<&Workspace> for WorkspaceConfig {
                 );
                 value.layout_options
             },
+            layout_options_rules: if value.layout_options_rules.is_empty() {
+                None
+            } else {
+                Some(value.layout_options_rules.iter().copied().collect())
+            },
             #[allow(deprecated)]
             custom_layout: value
                 .workspace_config
@@ -353,6 +376,7 @@ impl From<&Workspace> for WorkspaceConfig {
                 .workspace_config
                 .as_ref()
                 .and_then(|c| c.workspace_rules.clone()),
+            work_area_offset_rules,
             work_area_offset: value.work_area_offset,
             apply_window_based_work_area_offset: Some(value.apply_window_based_work_area_offset),
             window_container_behaviour: value.window_container_behaviour,
@@ -451,7 +475,7 @@ pub enum AppSpecificConfigurationPath {
 #[serde_with::serde_as]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-/// The `komorebi.json` static configuration file reference for `v0.1.40`
+/// The `komorebi.json` static configuration file reference for `v0.1.41`
 pub struct StaticConfig {
     /// DEPRECATED from v0.1.22: no longer required
     #[deprecated(note = "No longer required")]
@@ -571,6 +595,11 @@ pub struct StaticConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(extend("default" = DEFAULT_CONTAINER_PADDING)))]
     pub default_container_padding: Option<i32>,
+    /// Per-layout default options and rules, keyed by layout name.
+    /// Applied as fallback when a workspace does not define its own layout_options or layout_options_rules.
+    /// If a workspace defines either setting, all global defaults for that layout are completely replaced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout_defaults: Option<HashMap<DefaultLayout, LayoutDefaultEntry>>,
     /// Monitor and workspace configurations
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monitors: Option<Vec<MonitorConfig>>,
@@ -880,6 +909,14 @@ impl From<&WindowManager> for StaticConfig {
             default_container_padding: Option::from(
                 DEFAULT_CONTAINER_PADDING.load(Ordering::SeqCst),
             ),
+            layout_defaults: {
+                let guard = LAYOUT_DEFAULTS.lock();
+                if guard.is_empty() {
+                    None
+                } else {
+                    Some(guard.clone())
+                }
+            },
             monitors: Option::from(monitors),
             window_hiding_behaviour: Option::from(*HIDING_BEHAVIOUR.lock()),
             global_work_area_offset: value.work_area_offset,
@@ -993,6 +1030,12 @@ impl StaticConfig {
 
         if let Some(workspace) = self.default_workspace_padding {
             DEFAULT_WORKSPACE_PADDING.store(workspace, Ordering::SeqCst);
+        }
+
+        if let Some(defaults) = &self.layout_defaults {
+            *LAYOUT_DEFAULTS.lock() = defaults.clone();
+        } else {
+            LAYOUT_DEFAULTS.lock().clear();
         }
 
         if let Some(border_width) = self.border_width {
@@ -1403,7 +1446,7 @@ impl StaticConfig {
                             workspace_config.layout = Some(DefaultLayout::Columns);
                         }
 
-                        ws.load_static_config(workspace_config)?;
+                        ws.load_static_config(workspace_config, value.layout_defaults.as_ref())?;
                     }
                 }
 
@@ -1486,7 +1529,10 @@ impl StaticConfig {
 
                     for (j, ws) in m.workspaces_mut().iter_mut().enumerate() {
                         if let Some(workspace_config) = monitor_config.workspaces.get(j) {
-                            ws.load_static_config(workspace_config)?;
+                            ws.load_static_config(
+                                workspace_config,
+                                value.layout_defaults.as_ref(),
+                            )?;
                         }
                     }
 
@@ -1568,7 +1614,7 @@ impl StaticConfig {
 
                 for (j, ws) in monitor.workspaces_mut().iter_mut().enumerate() {
                     if let Some(workspace_config) = monitor_config.workspaces.get(j) {
-                        ws.load_static_config(workspace_config)?;
+                        ws.load_static_config(workspace_config, value.layout_defaults.as_ref())?;
                     }
                 }
 
@@ -1651,7 +1697,10 @@ impl StaticConfig {
 
                     for (j, ws) in m.workspaces_mut().iter_mut().enumerate() {
                         if let Some(workspace_config) = monitor_config.workspaces.get(j) {
-                            ws.load_static_config(workspace_config)?;
+                            ws.load_static_config(
+                                workspace_config,
+                                value.layout_defaults.as_ref(),
+                            )?;
                         }
                     }
 

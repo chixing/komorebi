@@ -172,6 +172,143 @@ consistently to all splits of that type throughout the layout. Additional values
 - Unspecified ratios default to sharing the remaining space equally
 - You only need to specify the ratios you want to customize; trailing values can be omitted
 
+## Layout Options Rules
+
+You can dynamically change `layout_options` based on the number of containers on a workspace
+using `layout_options_rules`. This uses the same threshold-based logic as `layout_rules`:
+when the container count is greater than or equal to a threshold, the highest matching
+threshold's options are used.
+
+Rules **fully replace** the base `layout_options` when they match. If no rule matches, the
+base `layout_options` is used.
+
+### Configuration
+
+```json
+{
+  "monitors": [
+    {
+      "workspaces": [
+        {
+          "name": "main",
+          "layout": "VerticalStack",
+          "layout_options": {
+            "column_ratios": [0.6],
+            "row_ratios": [0.4]
+          },
+          "layout_options_rules": {
+            "3": { "column_ratios": [0.55] },
+            "5": { "column_ratios": [0.3, 0.3, 0.3], "row_ratios": [0.5] }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+In the example above:
+
+| Container Count | Effective `layout_options` |
+|-----------------|---------------------------|
+| 1-2 | Base: `column_ratios: [0.6]`, `row_ratios: [0.4]` |
+| 3-4 | Rule "3": `column_ratios: [0.55]` (no row_ratios, no scrolling, no grid) |
+| 5+ | Rule "5": `column_ratios: [0.3, 0.3, 0.3]`, `row_ratios: [0.5]` |
+
+Rules can include any field that `layout_options` supports: `column_ratios`, `row_ratios`,
+`scrolling`, and `grid`. When a rule matches, it completely replaces the base options. Fields
+not specified in the matching rule default to their standard defaults (not the base
+`layout_options` values).
+
+### Example: Scrolling Layout with Dynamic Columns
+
+```json
+{
+  "layout": "Scrolling",
+  "layout_options": {
+    "scrolling": { "columns": 2 }
+  },
+  "layout_options_rules": {
+    "4": { "scrolling": { "columns": 3 } },
+    "7": { "scrolling": { "columns": 4 } }
+  }
+}
+```
+
+This increases the visible scrolling columns as more windows are added.
+
+## Layout Defaults
+
+You can define global per-layout default `layout_options` and `layout_options_rules` using
+the top-level `layout_defaults` setting. This avoids repeating the same configuration across
+every workspace that uses the same layout.
+
+### Configuration
+
+```json
+{
+  "layout_defaults": {
+    "VerticalStack": {
+      "layout_options": { "column_ratios": [0.7] },
+      "layout_options_rules": {
+        "2": { "column_ratios": [0.7] },
+        "3": { "column_ratios": [0.55] },
+        "5": { "column_ratios": [0.4] }
+      }
+    },
+    "Columns": {
+      "layout_options": { "column_ratios": [0.3, 0.4] },
+      "layout_options_rules": {
+        "4": { "column_ratios": [0.2, 0.3, 0.3] }
+      }
+    },
+    "HorizontalStack": {
+      "layout_options": { "row_ratios": [0.6] }
+    }
+  },
+  "monitors": [
+    {
+      "workspaces": [
+        {
+          "name": "main",
+          "layout": "VerticalStack"
+        }
+      ]
+    }
+  ]
+}
+```
+
+In this example, every workspace using `VerticalStack`, `Columns`, or `HorizontalStack`
+automatically gets the global `layout_options` and `layout_options_rules` without needing
+to specify them per-workspace. Note that `VerticalStack` only has 2 columns (main + stack),
+so only a single `column_ratios` value is meaningful, while `Columns` distributes windows
+across multiple columns where additional ratios control each column's width.
+
+### Resolution Cascade
+
+Global defaults act as a fallback. If a workspace defines **either** `layout_options` or
+`layout_options_rules`, it **completely replaces** all global `layout_defaults` for that
+layout. Global defaults are only used when the workspace has **neither** setting.
+
+Within the effective source (workspace or global):
+1. Try threshold match from the rules (highest matching threshold wins)
+2. If a rule matches → use it (full replacement of base options)
+3. Otherwise → use the base `layout_options`
+
+### Override Examples
+
+| Workspace Config | Global Config | Effective Behavior |
+|------------------|---------------|--------------------|
+| No `layout_options`, no rules | `layout_defaults` has both | Uses global base + global rules |
+| Has `layout_options` only | `layout_defaults` has both | Workspace base only (all globals ignored) |
+| Has `layout_options_rules` only | `layout_defaults` has both | Workspace rules only (all globals ignored) |
+| Has both | `layout_defaults` has both | All workspace (all globals ignored) |
+
+This "complete replacement" semantic means you never get a mix of workspace and global
+settings for the same layout. If you override anything at the workspace level, you take
+full control of that layout's options for that workspace.
+
 ## Progressive Ratio Behavior
 
 Ratios are applied progressively as windows are added. For example, with `row_ratios: [0.3, 0.5]` in a VerticalStack:

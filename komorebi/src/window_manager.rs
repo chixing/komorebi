@@ -239,23 +239,30 @@ impl WindowManager {
             let mouse_follows_focus = self.mouse_follows_focus;
             for (monitor_idx, monitor) in self.monitors_mut().iter_mut().enumerate() {
                 let mut focused_workspace = 0;
-                for (workspace_idx, workspace) in monitor.workspaces_mut().iter_mut().enumerate() {
-                    if let Some(state_monitor) = state.monitors.elements().get(monitor_idx)
-                        && let Some(state_workspace) = state_monitor.workspaces().get(workspace_idx)
+                if let Some(state_monitor) = state.monitors.elements().get(monitor_idx) {
+                    monitor
+                        .workspaces_mut()
+                        .resize(state_monitor.workspaces().len(), Workspace::default());
+
+                    for (workspace_idx, workspace) in
+                        monitor.workspaces_mut().iter_mut().enumerate()
                     {
-                        // to make sure padding and layout_options changes get applied for users after a quick restart
-                        let container_padding = workspace.container_padding;
-                        let workspace_padding = workspace.workspace_padding;
-                        let layout_options = workspace.layout_options;
+                        if let Some(state_workspace) = state_monitor.workspaces().get(workspace_idx)
+                        {
+                            // to make sure padding and layout_options changes get applied for users after a quick restart
+                            let container_padding = workspace.container_padding;
+                            let workspace_padding = workspace.workspace_padding;
+                            let layout_options = workspace.layout_options;
 
-                        *workspace = state_workspace.clone();
+                            *workspace = state_workspace.clone();
 
-                        workspace.container_padding = container_padding;
-                        workspace.workspace_padding = workspace_padding;
-                        workspace.layout_options = layout_options;
+                            workspace.container_padding = container_padding;
+                            workspace.workspace_padding = workspace_padding;
+                            workspace.layout_options = layout_options;
 
-                        if state_monitor.focused_workspace_idx() == workspace_idx {
-                            focused_workspace = workspace_idx;
+                            if state_monitor.focused_workspace_idx() == workspace_idx {
+                                focused_workspace = workspace_idx;
+                            }
                         }
                     }
                 }
@@ -2103,12 +2110,16 @@ impl WindowManager {
 
         tracing::info!("focusing container");
 
-        let new_idx =
-            if workspace.maximized_window.is_some() || workspace.monocle_container.is_some() {
-                None
-            } else {
-                workspace.new_idx_for_direction(direction)
-            };
+        if workspace.monocle_container.is_some() {
+            tracing::debug!("ignoring directional focus while monocle mode is active");
+            return Ok(());
+        }
+
+        let new_idx = if workspace.maximized_window.is_some() {
+            None
+        } else {
+            workspace.new_idx_for_direction(direction)
+        };
 
         let mut cross_monitor_monocle_or_max = false;
 
@@ -5657,6 +5668,62 @@ mod tests {
             let monocle_container = &wm.focused_workspace().unwrap().monocle_container;
             assert_eq!(*monocle_container, None);
         }
+    }
+
+    #[test]
+    fn test_directional_focus_does_not_replace_monocle_container() {
+        let (mut wm, _context) = setup_window_manager();
+
+        let mut monitor = monitor::new(
+            0,
+            Rect::default(),
+            Rect::default(),
+            "TestMonitor".to_string(),
+            "TestDevice".to_string(),
+            "TestDeviceID".to_string(),
+            Some("TestMonitorID".to_string()),
+        );
+
+        let workspace = monitor.focused_workspace_mut().unwrap();
+
+        for hwnd in [1, 2] {
+            let mut container = Container::default();
+            container.windows_mut().push_back(Window::from(hwnd));
+            workspace.add_container_to_back(container);
+        }
+
+        wm.monitors_mut().push_back(monitor);
+        wm.monocle_on().unwrap();
+
+        let (initial_monocle_hwnd, initial_restore_idx, initial_container_hwnds) = {
+            let workspace = wm.focused_workspace().unwrap();
+            let monocle = workspace.monocle_container.as_ref().unwrap();
+            let container_hwnds = workspace
+                .containers()
+                .iter()
+                .map(|container| container.windows()[0].hwnd)
+                .collect::<Vec<_>>();
+
+            (
+                monocle.focused_window().unwrap().hwnd,
+                workspace.monocle_container_restore_idx,
+                container_hwnds,
+            )
+        };
+
+        let _ = wm.focus_container_in_direction(OperationDirection::Right);
+
+        let workspace = wm.focused_workspace().unwrap();
+        let monocle = workspace.monocle_container.as_ref().unwrap();
+        let container_hwnds = workspace
+            .containers()
+            .iter()
+            .map(|container| container.windows()[0].hwnd)
+            .collect::<Vec<_>>();
+
+        assert_eq!(monocle.focused_window().unwrap().hwnd, initial_monocle_hwnd);
+        assert_eq!(workspace.monocle_container_restore_idx, initial_restore_idx);
+        assert_eq!(container_hwnds, initial_container_hwnds);
     }
 
     #[test]

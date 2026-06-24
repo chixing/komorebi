@@ -28,6 +28,17 @@ upstream  https://github.com/LGUG2Z/komorebi.git
 Upstream releases are integrated on a temporary branch and merged into `main`
 only after the fork-specific behavior and layout modes have been tested.
 
+## v0.1.41 candidate
+
+The `upgrade/1.41` branch integrates upstream `v0.1.41` while preserving:
+
+- the fork's per-window virtual-desktop isolation;
+- the `v0.1.40` monocle behavior, where directional focus commands do not
+  replace the active monocle container.
+
+The installed stable release remains `v0.1.40-desktop-isolation.1` until this
+candidate passes local and hands-on testing.
+
 ## Releases
 
 Pushing a `v*` tag runs the Windows workflow and publishes matching binaries,
