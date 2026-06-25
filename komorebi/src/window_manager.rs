@@ -239,23 +239,30 @@ impl WindowManager {
             let mouse_follows_focus = self.mouse_follows_focus;
             for (monitor_idx, monitor) in self.monitors_mut().iter_mut().enumerate() {
                 let mut focused_workspace = 0;
-                for (workspace_idx, workspace) in monitor.workspaces_mut().iter_mut().enumerate() {
-                    if let Some(state_monitor) = state.monitors.elements().get(monitor_idx)
-                        && let Some(state_workspace) = state_monitor.workspaces().get(workspace_idx)
+                if let Some(state_monitor) = state.monitors.elements().get(monitor_idx) {
+                    monitor
+                        .workspaces_mut()
+                        .resize(state_monitor.workspaces().len(), Workspace::default());
+
+                    for (workspace_idx, workspace) in
+                        monitor.workspaces_mut().iter_mut().enumerate()
                     {
-                        // to make sure padding and layout_options changes get applied for users after a quick restart
-                        let container_padding = workspace.container_padding;
-                        let workspace_padding = workspace.workspace_padding;
-                        let layout_options = workspace.layout_options;
+                        if let Some(state_workspace) = state_monitor.workspaces().get(workspace_idx)
+                        {
+                            // to make sure padding and layout_options changes get applied for users after a quick restart
+                            let container_padding = workspace.container_padding;
+                            let workspace_padding = workspace.workspace_padding;
+                            let layout_options = workspace.layout_options;
 
-                        *workspace = state_workspace.clone();
+                            *workspace = state_workspace.clone();
 
-                        workspace.container_padding = container_padding;
-                        workspace.workspace_padding = workspace_padding;
-                        workspace.layout_options = layout_options;
+                            workspace.container_padding = container_padding;
+                            workspace.workspace_padding = workspace_padding;
+                            workspace.layout_options = layout_options;
 
-                        if state_monitor.focused_workspace_idx() == workspace_idx {
-                            focused_workspace = workspace_idx;
+                            if state_monitor.focused_workspace_idx() == workspace_idx {
+                                focused_workspace = workspace_idx;
+                            }
                         }
                     }
                 }
@@ -5657,6 +5664,74 @@ mod tests {
             let monocle_container = &wm.focused_workspace().unwrap().monocle_container;
             assert_eq!(*monocle_container, None);
         }
+    }
+
+    #[test]
+    fn test_directional_focus_crosses_monitor_while_monocled() {
+        let (mut wm, _context) = setup_window_manager();
+
+        let mut left_monitor = monitor::new(
+            0,
+            Rect {
+                left: 0,
+                right: 1920,
+                top: 0,
+                bottom: 1080,
+            },
+            Rect {
+                left: 0,
+                right: 1920,
+                top: 0,
+                bottom: 1080,
+            },
+            "TestMonitor".to_string(),
+            "TestDevice".to_string(),
+            "TestDeviceID".to_string(),
+            Some("TestMonitorID".to_string()),
+        );
+
+        let mut container = Container::default();
+        container.windows_mut().push_back(Window::from(1));
+        left_monitor
+            .focused_workspace_mut()
+            .unwrap()
+            .add_container_to_back(container);
+
+        let right_monitor = monitor::new(
+            1,
+            Rect {
+                left: 1920,
+                right: 1920,
+                top: 0,
+                bottom: 1080,
+            },
+            Rect {
+                left: 1920,
+                right: 1920,
+                top: 0,
+                bottom: 1080,
+            },
+            "TestMonitor2".to_string(),
+            "TestDevice2".to_string(),
+            "TestDeviceID2".to_string(),
+            Some("TestMonitorID2".to_string()),
+        );
+
+        wm.monitors_mut().push_back(left_monitor);
+        wm.monitors_mut().push_back(right_monitor);
+        wm.focus_monitor(0).unwrap();
+        wm.monocle_on().unwrap();
+
+        let _ = wm.focus_container_in_direction(OperationDirection::Right);
+
+        assert_eq!(wm.focused_monitor_idx(), 1);
+        assert!(
+            wm.monitors()[0]
+                .focused_workspace()
+                .unwrap()
+                .monocle_container
+                .is_some()
+        );
     }
 
     #[test]

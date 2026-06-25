@@ -15,6 +15,7 @@ use strum::EnumString;
 
 use crate::KomorebiTheme;
 use crate::animation::prefix::AnimationPrefix;
+use crate::state::State;
 
 // Re-export everything from komorebi-layouts
 pub use komorebi_layouts::Arrangement;
@@ -31,6 +32,7 @@ pub use komorebi_layouts::DefaultLayout;
 pub use komorebi_layouts::Direction;
 pub use komorebi_layouts::GridLayoutOptions;
 pub use komorebi_layouts::Layout;
+pub use komorebi_layouts::LayoutDefaultEntry;
 pub use komorebi_layouts::LayoutOptions;
 pub use komorebi_layouts::MAX_RATIO;
 pub use komorebi_layouts::MAX_RATIOS;
@@ -256,6 +258,8 @@ pub enum SocketMessage {
     StaticConfigSchema,
     GenerateStaticConfig,
     DebugWindow(isize),
+    // low level commands
+    ApplyState(State),
 }
 
 impl SocketMessage {

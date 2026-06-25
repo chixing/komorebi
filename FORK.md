@@ -4,16 +4,18 @@ This fork maintains a complete, matched komorebi executable suite.
 
 ## Stable release line
 
-The current stable line is based on upstream `v0.1.40` and adds:
+The current stable line is based on upstream `v0.1.41` and adds:
 
 - per-window virtual-desktop filtering before window-manager event processing;
 - removal of managed windows that Windows moves to another virtual desktop;
-- source-workspace retiling after such a move.
+- source-workspace retiling after such a move;
+- the upstream `v0.1.40` directional-focus behavior while monocled, allowing
+  focus to cross to an adjacent monitor instead of cycling monocle windows.
 
 Release tags use the neutral form:
 
 ```text
-v0.1.40-desktop-isolation.1
+v0.1.41-desktop-isolation.1
 ```
 
 ## Upstream

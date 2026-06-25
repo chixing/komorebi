@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "StaticConfig",
-  "description": "The `komorebi.json` static configuration file reference for `v0.1.40`",
+  "description": "The `komorebi.json` static configuration file reference for `v0.1.41`",
   "type": "object",
   "properties": {
     "animation": {
@@ -302,6 +302,16 @@
       ],
       "items": {
         "$ref": "#/$defs/MatchingRule"
+      }
+    },
+    "layout_defaults": {
+      "description": "Per-layout default options and rules, keyed by layout name.\nApplied as fallback when a workspace does not define its own layout_options or layout_options_rules.\nIf a workspace defines either setting, all global defaults for that layout are completely replaced.",
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": {
+        "$ref": "#/$defs/LayoutDefaultEntry"
       }
     },
     "manage_rules": {
@@ -703,7 +713,7 @@
         },
         {
           "title": "CubicBezier",
-          "description": "Custom Cubic Bézier function",
+          "description": "Custom Cubic Bezier function",
           "type": "object",
           "properties": {
             "CubicBezier": {
@@ -3290,6 +3300,36 @@
         "colours"
       ]
     },
+    "LayoutDefaultEntry": {
+      "description": "Per-layout default options entry for the `layout_defaults` global setting.\nContains both base layout options and threshold-based layout options rules.",
+      "type": "object",
+      "properties": {
+        "layout_options": {
+          "description": "Default layout options for this layout",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LayoutOptions"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "layout_options_rules": {
+          "description": "Threshold-based layout options rules in the format of threshold => options.\nWhen container count >= threshold, the highest matching threshold's options\nfully replace the base `layout_options`.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "patternProperties": {
+            "^\\d+$": {
+              "$ref": "#/$defs/LayoutOptions"
+            }
+          }
+        }
+      }
+    },
     "LayoutOptions": {
       "description": "Options for specific layouts",
       "type": "object",
@@ -4214,6 +4254,19 @@
             }
           ]
         },
+        "layout_options_rules": {
+          "description": "Threshold-based layout options rules in the format of threshold => options.\nWhen container count >= threshold, the highest matching threshold's options\nfully replace the base `layout_options`.\nThis follows the same threshold logic as `layout_rules`.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "patternProperties": {
+            "^\\d+$": {
+              "$ref": "#/$defs/LayoutOptions"
+            }
+          }
+        },
         "layout_rules": {
           "description": "Layout rules in the format of threshold => layout",
           "type": [
@@ -4285,6 +4338,19 @@
               "type": "null"
             }
           ]
+        },
+        "work_area_offset_rules": {
+          "description": "Work area offset rules in the format of threshold => Rect (default: None)",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "patternProperties": {
+            "^\\d+$": {
+              "$ref": "#/$defs/Rect"
+            }
+          }
         },
         "workspace_padding": {
           "description": "Workspace padding (default: global)",

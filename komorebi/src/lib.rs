@@ -238,6 +238,9 @@ lazy_static! {
     static ref FLOATING_WINDOW_TOGGLE_ASPECT_RATIO: Arc<Mutex<AspectRatio>> = Arc::new(Mutex::new(AspectRatio::Predefined(PredefinedAspectRatio::Widescreen)));
 
     static ref CURRENT_VIRTUAL_DESKTOP: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+
+    pub static ref LAYOUT_DEFAULTS: Arc<Mutex<HashMap<DefaultLayout, LayoutDefaultEntry>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 }
 
 pub static DEFAULT_WORKSPACE_PADDING: AtomicI32 = AtomicI32::new(10);
@@ -322,7 +325,7 @@ pub fn current_virtual_desktop() -> Option<Vec<u8>> {
     // the latter case, if the user desires this validation after initiating the task view, komorebi
     // should be restarted, and then when this // fn runs again for the first time, it will pick up
     // the value of CurrentVirtualDesktop and validate against it accordingly
-    current
+    current.map(|current| current.to_vec())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
