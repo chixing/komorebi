@@ -1,5 +1,5 @@
 {
-  "version": "0.1.40-desktop-isolation.1",
+  "version": "0.1.41-desktop-isolation.1",
   "description": "Tiling window manager for Windows with virtual-desktop isolation fixes",
   "homepage": "https://github.com/chixing/komorebi",
   "license": {
@@ -8,8 +8,8 @@
   },
   "architecture": {
     "64bit": {
-      "url": "https://github.com/chixing/komorebi/releases/download/v0.1.40-desktop-isolation.1/komorebi-0.1.40-desktop-isolation.1-x86_64-pc-windows-msvc.zip",
-      "hash": "264dccae1b3295c31de716d1a6f83a260e2587827ec0c01b1c0f7b90a9470067"
+      "url": "https://github.com/chixing/komorebi/releases/download/v0.1.41-desktop-isolation.1/komorebi-0.1.41-desktop-isolation.1-x86_64-pc-windows-msvc.zip",
+      "hash": "8e62ed89f6496300bc7833f28a04f07a7b4bf19080fed6f3cb1a7746048e8160"
     }
   },
   "bin": [
