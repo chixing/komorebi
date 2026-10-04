@@ -41,6 +41,60 @@ use crate::windows_api::WindowsApi;
 use crate::winevent::WinEvent;
 use crate::workspace::WorkspaceLayer;
 
+fn should_skip_focus_change(foreground_hwnd: Option<isize>, window_hwnd: isize) -> bool {
+    matches!(foreground_hwnd, Some(hwnd) if hwnd != window_hwnd)
+}
+
+/// After a managed window is destroyed, Windows may promote no successor, leaving
+/// the foreground null with no FocusChange to reconcile from. The selection then
+/// never regains focus: every border renders unfocused and keystrokes fall through
+/// to nothing until the user refocuses by hand. Refocus only in that case, otherwise
+/// foreground successor is left to FocusChange so we don't fight the OS or desync
+/// focus.
+fn should_refocus_after_destroy(foreground_hwnd: Option<isize>) -> bool {
+    matches!(foreground_hwnd, None | Some(0))
+}
+
+#[cfg(test)]
+mod focus_change_tests {
+    use super::should_skip_focus_change;
+
+    #[test]
+    fn skips_focus_change_from_background_window() {
+        assert!(should_skip_focus_change(Some(1), 2));
+    }
+
+    #[test]
+    fn allows_focus_change_for_foreground_window() {
+        assert!(!should_skip_focus_change(Some(1), 1));
+    }
+
+    #[test]
+    fn allows_focus_change_when_foreground_unknown() {
+        assert!(!should_skip_focus_change(None, 1));
+    }
+}
+
+#[cfg(test)]
+mod destroy_focus_tests {
+    use super::should_refocus_after_destroy;
+
+    #[test]
+    fn refocuses_when_foreground_is_null() {
+        assert!(should_refocus_after_destroy(Some(0)));
+    }
+
+    #[test]
+    fn refocuses_when_foreground_is_unavailable() {
+        assert!(should_refocus_after_destroy(None));
+    }
+
+    #[test]
+    fn defers_when_a_successor_took_the_foreground() {
+        assert!(!should_refocus_after_destroy(Some(12345)));
+    }
+}
+
 #[tracing::instrument]
 pub fn listen_for_events(wm: Arc<Mutex<WindowManager>>) {
     let receiver = wm.lock().incoming_events.clone();
@@ -291,7 +345,13 @@ impl WindowManager {
             WindowManagerEvent::Destroy(_, window) | WindowManagerEvent::Unmanage(window) => {
                 if self.focused_workspace()?.contains_window(window.hwnd) {
                     self.focused_workspace_mut()?.remove_window(window.hwnd)?;
-                    self.update_focused_workspace(false, false)?;
+
+                    // With refocus true, update_focused_workspace focuses the surviving
+                    // selection (maximized/monocle/tiling); with refocus false it only
+                    // re-tiles.
+                    let refocus =
+                        should_refocus_after_destroy(WindowsApi::foreground_window().ok());
+                    self.update_focused_workspace(refocus, refocus)?;
 
                     let mut already_moved_window_handles = self.already_moved_window_handles.lock();
 
@@ -374,6 +434,13 @@ impl WindowManager {
                 already_moved_window_handles.remove(&window.hwnd);
             }
             WindowManagerEvent::FocusChange(_, window) => {
+                if should_skip_focus_change(WindowsApi::foreground_window().ok(), window.hwnd) {
+                    tracing::debug!(
+                        "ignoring stale focus change for hwnd {} as it is not the foreground window",
+                        window.hwnd
+                    );
+                    return Ok(());
+                }
                 // don't want to trigger the full workspace updates when there are no managed
                 // containers - this makes floating windows on empty workspaces go into very
                 // annoying focus change loops which prevents users from interacting with them

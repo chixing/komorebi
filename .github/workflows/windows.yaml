@@ -66,12 +66,8 @@ jobs:
           cache-on-failure: "true"
           cache-all-crates: "true"
           key: build-${{ env.TARGET }}-${{ env.RUST_VERSION }}
-      - uses: houseabsolute/actions-rust-cross@v1
-        with:
-          command: build
-          toolchain: ${{ env.RUST_VERSION }}
-          target: ${{ env.TARGET }}
-          args: --locked --release
+      - name: Build release binaries
+        run: cargo +${{ env.RUST_VERSION }} build --locked --release --target ${{ env.TARGET }}
       - name: Build MSI
         shell: pwsh
         run: |
