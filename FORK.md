@@ -10,7 +10,9 @@ The current stable line is based on upstream `v0.1.41` and adds:
 - removal of managed windows that Windows moves to another virtual desktop;
 - source-workspace retiling after such a move;
 - the upstream `v0.1.40` directional-focus behavior while monocled, allowing
-  focus to cross to an adjacent monitor instead of cycling monocle windows.
+  focus to cross to an adjacent monitor instead of cycling monocle windows;
+- synchronous border positioning and redraws on size/rect changes, keeping
+  borders painted with `"window_handling_behaviour": "Async"`.
 
 Release tags use the neutral form:
 

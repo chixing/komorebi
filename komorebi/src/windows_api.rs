@@ -586,17 +586,11 @@ impl WindowsApi {
     }
 
     pub fn set_border_pos(hwnd: isize, layout: &Rect, position: isize) -> eyre::Result<()> {
-        let mut flags = SetWindowPosition::NO_SEND_CHANGING
+        // Our border windows must resize synchronously before the D2D render target is resized and drawn.
+        let flags = SetWindowPosition::NO_SEND_CHANGING
             | SetWindowPosition::NO_ACTIVATE
             | SetWindowPosition::NO_REDRAW
             | SetWindowPosition::SHOW_WINDOW;
-
-        if matches!(
-            WINDOW_HANDLING_BEHAVIOUR.load(),
-            WindowHandlingBehaviour::Async
-        ) {
-            flags |= SetWindowPosition::ASYNC_WINDOW_POS;
-        }
 
         Self::set_window_pos(
             HWND(as_ptr!(hwnd)),

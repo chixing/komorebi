@@ -608,9 +608,11 @@ pub fn handle_notifications(wm: Arc<Mutex<WindowManager>>) -> color_eyre::Result
                                     continue 'containers;
                                 }
                             };
+                            let rect_changed = rect != border.window_rect;
                             border.window_rect = rect;
 
                             let should_invalidate = new_border
+                                || rect_changed
                                 || (last_focus_state != new_focus_state)
                                 || layer_changed
                                 || forced_update;
@@ -696,10 +698,14 @@ fn handle_floating_borders(
         border.monitor_idx = Some(monitor_idx);
 
         let rect = WindowsApi::window_rect(window.hwnd)?;
+        let rect_changed = rect != border.window_rect;
         border.window_rect = rect;
 
-        let should_invalidate =
-            new_border || (last_focus_state != new_focus_state) || layer_changed || forced_update;
+        let should_invalidate = new_border
+            || rect_changed
+            || (last_focus_state != new_focus_state)
+            || layer_changed
+            || forced_update;
 
         if should_invalidate {
             if forced_update && !new_border {
