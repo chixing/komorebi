@@ -52,6 +52,7 @@ A clean release build takes about 3 minutes; an incremental one under a minute.
 Stop komorebi, copy the six executables (`komorebi`, `komorebic`,
 `komorebic-no-console`, `komorebi-bar`, `komorebi-gui`, `komorebi-shortcuts`)
 from `target_64-pc-windows-msvcelease` over
+elease` over
 `~\scooppps\komorebi-desktop-isolation\current`, then start komorebi.
 `komorebic --version` shows the deployed branch or tag and commit.
 
