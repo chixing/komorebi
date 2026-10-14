@@ -349,10 +349,15 @@ impl Border {
         };
     }
 
-    pub fn set_position(&self, rect: &Rect, reference_hwnd: isize) -> color_eyre::Result<()> {
+    fn border_rect(&self, rect: &Rect) -> Rect {
         let mut rect = *rect;
         rect.add_margin(self.width);
         rect.add_padding(-self.offset);
+        rect
+    }
+
+    pub fn set_position(&self, rect: &Rect, reference_hwnd: isize) -> color_eyre::Result<()> {
+        let rect = self.border_rect(rect);
 
         WindowsApi::set_border_pos(self.hwnd, &rect, reference_hwnd)?;
 
@@ -439,17 +444,19 @@ impl Border {
 
                         let border_width = (*border_pointer).width;
                         let border_offset = (*border_pointer).offset;
+                        // Draw using the border window's size, not the smaller tracked window's size.
+                        let border_rect = (*border_pointer).border_rect(&rect);
 
                         (*border_pointer).rounded_rect.rect = D2D_RECT_F {
                             left: (border_width / 2 - border_offset) as f32,
                             top: (border_width / 2 - border_offset) as f32,
-                            right: (rect.right - border_width / 2 + border_offset) as f32,
-                            bottom: (rect.bottom - border_width / 2 + border_offset) as f32,
+                            right: (border_rect.right - border_width / 2 + border_offset) as f32,
+                            bottom: (border_rect.bottom - border_width / 2 + border_offset) as f32,
                         };
 
                         let _ = render_target.Resize(&D2D_SIZE_U {
-                            width: rect.right as u32,
-                            height: rect.bottom as u32,
+                            width: border_rect.right as u32,
+                            height: border_rect.bottom as u32,
                         });
 
                         let window_kind = (*border_pointer).window_kind;
