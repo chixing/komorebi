@@ -34,45 +34,33 @@ only after the fork-specific behavior and layout modes have been tested.
 
 ## Releases
 
-Pushing a `v*` tag runs the Windows workflow and publishes matching binaries,
-MSI installers, ZIP archives, and SHA-256 checksums from the tagged commit.
-The release workflow then updates the Scoop manifest in `bucket/`.
+GitHub Actions is disabled for this fork. Builds are local only; the
+workflow files stay in `.github/` to keep upstream merges clean.
+
+Validate, build, and install the complete suite:
+
+```powershell
+$Env:RUSTFLAGS = '-Ctarget-feature=+crt-static -Dwarnings'
+cargo +nightly-2026-06-23 fmt --check
+cargo +1.96.0 clippy --locked
+cargo +1.96.0 test --locked
+cargo +1.96.0 build --locked --release --target x86_64-pc-windows-msvc
+```
+
+A clean release build takes about 3 minutes; an incremental one under a minute.
+
+Stop komorebi, copy the six executables (`komorebi`, `komorebic`,
+`komorebic-no-console`, `komorebi-bar`, `komorebi-gui`, `komorebi-shortcuts`)
+from `target_64-pc-windows-msvcelease` over
+`~\scooppps\komorebi-desktop-isolation\current`, then start komorebi.
+`komorebic --version` shows the deployed branch or tag and commit.
+
+Tags mark deployed commits. They no longer publish GitHub releases.
 
 The fork does not submit releases to the official Winget package.
 
-## Actions workflow
-
-The Windows workflow uses a staged release pipeline:
-
-1. validate formatting, Clippy, and tests on pinned Rust toolchains;
-2. build the x86_64 executable and MSI artifacts;
-3. package the x86_64 artifacts and calculate checksums on every run;
-4. publish a GitHub release only for a `v*` tag;
-5. update the Scoop manifest only after the release succeeds.
-
-Pull requests and manual workflow runs are dry runs: they build and package
-artifacts but cannot publish a release or modify the Scoop manifest.
-
-Before merging workflow changes into `main`:
-
-1. run the pinned formatting, Clippy, and test commands locally;
-2. push an isolated `ci/*` branch;
-3. manually run the workflow on the isolated branch;
-4. inspect the packaged dry-run artifact;
-5. merge only after all jobs pass.
-
 ## Scoop
 
-Add this repository as a Scoop bucket and install the complete suite:
-
-```powershell
-scoop bucket add komorebi-fork https://github.com/chixing/komorebi
-scoop install komorebi-fork/komorebi-desktop-isolation
-```
-
-Update through Scoop:
-
-```powershell
-scoop update
-scoop update komorebi-desktop-isolation
-```
+The Scoop install from `bucket/` is only a container for the local build. The
+manifest stays at `0.1.41-desktop-isolation.1`, so `scoop update` leaves the
+local executables alone. Do not run `scoop uninstall` or `scoop reset` on it.
