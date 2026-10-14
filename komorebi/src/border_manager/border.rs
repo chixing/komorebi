@@ -427,6 +427,10 @@ impl Border {
 
                     let old_rect = (*border_pointer).window_rect;
                     let rect = WindowsApi::window_rect(reference_hwnd).unwrap_or_default();
+                    let old_border_rect =
+                        WindowsApi::window_rect(window.0 as isize).unwrap_or_default();
+                    // Draw using the border window's size, not the smaller tracked window's size.
+                    let border_rect = (*border_pointer).border_rect(&rect);
 
                     (*border_pointer).window_rect = rect;
 
@@ -434,7 +438,10 @@ impl Border {
                         tracing::error!("failed to update border position {error}");
                     }
 
-                    if (!rect.is_same_size_as(&old_rect) || !rect.has_same_position_as(&old_rect))
+                    // The border manager may already have updated window_rect before this event.
+                    if (!border_rect.is_same_size_as(&old_border_rect)
+                        || !rect.is_same_size_as(&old_rect)
+                        || !rect.has_same_position_as(&old_rect))
                         && let Some(render_target) = (*border_pointer).render_target.as_ref()
                     {
                         // double-check destruction flag before rendering
@@ -444,8 +451,6 @@ impl Border {
 
                         let border_width = (*border_pointer).width;
                         let border_offset = (*border_pointer).offset;
-                        // Draw using the border window's size, not the smaller tracked window's size.
-                        let border_rect = (*border_pointer).border_rect(&rect);
 
                         (*border_pointer).rounded_rect.rect = D2D_RECT_F {
                             left: (border_width / 2 - border_offset) as f32,
