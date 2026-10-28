@@ -17,25 +17,25 @@ pub fn listen_for_movements(wm: Arc<Mutex<WindowManager>>) {
         let receiver = message_loop::start().expect("could not start winput message loop");
 
         loop {
-            let focus_follows_mouse = wm.lock().focus_follows_mouse;
-            if matches!(
-                focus_follows_mouse,
-                Some(FocusFollowsMouseImplementation::Komorebi)
-            ) {
-                match receiver.next_event() {
-                    // Don't want to send any raise events while we are dragging or resizing
-                    Event::MouseButton { action, .. } => match action {
-                        Action::Press => ignore_movement = true,
-                        Action::Release => ignore_movement = false,
-                    },
-                    Event::MouseMoveRelative { .. } if !ignore_movement => {
-                        match wm.lock().raise_window_at_cursor_pos() {
-                            Ok(()) => {}
-                            Err(error) => tracing::error!("{}", error),
-                        }
+            // Always block on the next event. Checking the implementation
+            // before waiting turns this into a busy loop while ffm is disabled.
+            match receiver.next_event() {
+                // Don't want to send any raise events while we are dragging or resizing
+                Event::MouseButton { action, .. } => match action {
+                    Action::Press => ignore_movement = true,
+                    Action::Release => ignore_movement = false,
+                },
+                Event::MouseMoveRelative { .. } if !ignore_movement => {
+                    let mut wm = wm.lock();
+                    if matches!(
+                        wm.focus_follows_mouse,
+                        Some(FocusFollowsMouseImplementation::Komorebi)
+                    ) && let Err(error) = wm.raise_window_at_cursor_pos()
+                    {
+                        tracing::error!("{}", error);
                     }
-                    _ => {}
                 }
+                _ => {}
             }
         }
     });
