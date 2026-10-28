@@ -143,6 +143,12 @@ impl WindowManager {
     #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
     #[tracing::instrument(skip(self, event), fields(event = event.title(), winevent = event.winevent(), hwnd = event.hwnd()))]
     pub fn process_event(&mut self, event: WindowManagerEvent) -> eyre::Result<()> {
+        // Dequeuing completes the pending request even if a guard below skips
+        // it or focusing fails (for example while the Start menu owns focus).
+        if matches!(event, WindowManagerEvent::Raise(_)) {
+            self.has_pending_raise_op = false;
+        }
+
         if self.is_paused {
             tracing::trace!("ignoring while paused");
             return Ok(());
@@ -340,7 +346,6 @@ impl WindowManager {
         match event {
             WindowManagerEvent::Raise(window) => {
                 window.focus(false)?;
-                self.has_pending_raise_op = false;
             }
             WindowManagerEvent::Destroy(_, window) | WindowManagerEvent::Unmanage(window) => {
                 if self.focused_workspace()?.contains_window(window.hwnd) {

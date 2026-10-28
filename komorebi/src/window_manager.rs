@@ -3932,6 +3932,29 @@ mod tests {
     }
 
     #[test]
+    fn skipped_raise_does_not_block_later_mouse_focus() {
+        let (mut wm, _test_context) = setup_window_manager();
+        wm.is_paused = true;
+        wm.has_pending_raise_op = true;
+
+        wm.process_event(WindowManagerEvent::Raise(Window::from(0)))
+            .unwrap();
+
+        assert!(!wm.has_pending_raise_op);
+    }
+
+    #[test]
+    fn invalid_raise_does_not_block_later_mouse_focus() {
+        let (mut wm, _test_context) = setup_window_manager();
+        wm.has_pending_raise_op = true;
+
+        // A window can disappear between queuing and processing the request.
+        let _ = wm.process_event(WindowManagerEvent::Raise(Window::from(0)));
+
+        assert!(!wm.has_pending_raise_op);
+    }
+
+    #[test]
     fn test_focus_workspace() {
         let (mut wm, _test_context) = setup_window_manager();
 
