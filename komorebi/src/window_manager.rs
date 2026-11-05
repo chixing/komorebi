@@ -22,9 +22,15 @@ use parking_lot::Mutex;
 use uds_windows::UnixListener;
 use uds_windows::UnixStream;
 
+use crate::HIDING_BEHAVIOUR;
+use crate::HidingBehaviour;
 use crate::animation::ANIMATION_ENABLED_GLOBAL;
 use crate::animation::ANIMATION_ENABLED_PER_ANIMATION;
 use crate::animation::AnimationEngine;
+use crate::animation::engine::AnimationBatch;
+use crate::animation::transition;
+use crate::animation::transition::SlideDirection;
+use crate::animation::workspace_transitions_enabled;
 use crate::core::Arrangement;
 use crate::core::Axis;
 use crate::core::BorderImplementation;
@@ -33,6 +39,7 @@ use crate::core::CycleDirection;
 use crate::core::DefaultLayout;
 use crate::core::FocusFollowsMouseImplementation;
 use crate::core::Layout;
+use crate::core::MonocleFocusBehaviour;
 use crate::core::MoveBehaviour;
 use crate::core::OperationBehaviour;
 use crate::core::OperationDirection;
@@ -81,13 +88,15 @@ pub struct WindowManager {
     pub window_management_behaviour: WindowManagementBehaviour,
     pub cross_monitor_move_behaviour: MoveBehaviour,
     pub cross_boundary_behaviour: CrossBoundaryBehaviour,
+    pub monocle_focus_behaviour: MonocleFocusBehaviour,
     pub unmanaged_window_operation_behaviour: OperationBehaviour,
     pub focus_follows_mouse: Option<FocusFollowsMouseImplementation>,
     pub mouse_follows_focus: bool,
     pub hotwatch: Hotwatch,
     pub virtual_desktop_id: Option<Vec<u8>>,
     pub has_pending_raise_op: bool,
-    pub pending_move_op: Arc<Option<(usize, usize, isize)>>,
+    /// (monitor, workspace, hwnd, rect of the window when the move/resize started)
+    pub pending_move_op: Arc<Option<(usize, usize, isize, Rect)>>,
     pub already_moved_window_handles: Arc<Mutex<HashSet<isize>>>,
     pub uncloack_to_ignore: usize,
     /// Maps each known window hwnd to the (monitor, workspace) index pair managing it
@@ -158,6 +167,7 @@ impl WindowManager {
             window_management_behaviour: WindowManagementBehaviour::default(),
             cross_monitor_move_behaviour: MoveBehaviour::Swap,
             cross_boundary_behaviour: CrossBoundaryBehaviour::Monitor,
+            monocle_focus_behaviour: MonocleFocusBehaviour::default(),
             unmanaged_window_operation_behaviour: OperationBehaviour::Op,
             resize_delta: 50,
             focus_follows_mouse: None,
@@ -174,6 +184,7 @@ impl WindowManager {
     #[tracing::instrument(skip(self))]
     pub fn init(&mut self) -> eyre::Result<()> {
         tracing::info!("initialising");
+        crate::cloaked::uncloak_left_behind();
         WindowsApi::load_monitor_information(self)?;
         WindowsApi::load_workspace_information(&mut self.monitors)
     }
@@ -765,9 +776,11 @@ impl WindowManager {
 
             // Reset any resize adjustments if we want to force a retile
             if !preserve_resize_dimensions {
-                for resize in &mut workspace.resize_dimensions {
-                    *resize = None;
-                }
+                workspace.resize_dimensions.fill(None);
+
+                // and the widths and heights of the Scrolling layout, which are resize
+                // adjustments too
+                workspace.reset_scrolling_sizes();
             }
 
             if (workspace.wallpaper.is_some() || monitor_wp.is_some())
@@ -1268,6 +1281,16 @@ impl WindowManager {
             }
             WorkspaceLayer::Tiling => {
                 match workspace.layout {
+                    Layout::Default(DefaultLayout::Scrolling) => {
+                        tracing::info!("resizing column");
+                        workspace.resize_scrolling_column(direction, sizing, delta);
+
+                        return if update {
+                            self.update_focused_workspace(false, false)
+                        } else {
+                            Ok(())
+                        };
+                    }
                     Layout::Default(layout) => {
                         tracing::info!("resizing window");
                         let len = NonZeroUsize::new(workspace.containers().len())
@@ -1323,15 +1346,67 @@ impl WindowManager {
                                 }
                             }
 
-                            let resize = layout.resize(
-                                unaltered
-                                    .get(focused_idx)
-                                    .ok_or_eyre("there is no last layout")?,
-                                focused_idx_resize,
-                                direction,
-                                sizing,
-                                delta,
-                            );
+                            let min_width = focused_monitor_work_area.right / 10;
+                            let min_height = focused_monitor_work_area.bottom / 10;
+                            let unaltered_rect = *unaltered
+                                .get(focused_idx)
+                                .ok_or_eyre("there is no last layout")?;
+
+                            let candidate = |amount: i32| {
+                                layout.resize(
+                                    &unaltered_rect,
+                                    focused_idx_resize,
+                                    direction,
+                                    sizing,
+                                    amount,
+                                )
+                            };
+
+                            let calculate = |dimensions: &[Option<Rect>]| {
+                                layout.calculate(
+                                    &focused_monitor_work_area,
+                                    len,
+                                    workspace.container_padding,
+                                    workspace.layout_flip,
+                                    dimensions,
+                                    workspace.focused_container_idx(),
+                                    workspace.layout_options,
+                                    &workspace.latest_layout,
+                                )
+                            };
+
+                            // No tile may end up smaller than a tenth of the work area, or
+                            // smaller than it already is
+                            let now = calculate(&workspace.resize_dimensions);
+                            let fits = |amount: i32| {
+                                let mut dimensions = workspace.resize_dimensions.clone();
+                                dimensions[focused_idx] = candidate(amount);
+                                calculate(&dimensions).iter().zip(now.iter()).all(
+                                    |(tile, before)| {
+                                        tile.right >= min_width.min(before.right)
+                                            && tile.bottom >= min_height.min(before.bottom)
+                                    },
+                                )
+                            };
+
+                            // Grant as much of the request as fits; tiles only get smaller as
+                            // the amount grows, so bisect
+                            let granted = if fits(delta) {
+                                delta
+                            } else {
+                                let (mut fits_at, mut fails_at) = (0, delta);
+                                while fails_at - fits_at > 1 {
+                                    let middle = fits_at + (fails_at - fits_at) / 2;
+                                    if fits(middle) {
+                                        fits_at = middle;
+                                    } else {
+                                        fails_at = middle;
+                                    }
+                                }
+                                fits_at
+                            };
+
+                            let resize = candidate(granted);
 
                             workspace.resize_dimensions[focused_idx] = resize;
 
@@ -1605,6 +1680,11 @@ impl WindowManager {
         follow: bool,
         move_direction: Option<OperationDirection>,
     ) -> eyre::Result<()> {
+        // check the target before anything is taken out of the workspace it is in
+        if monitor_idx >= self.monitors().len() {
+            bail!("there is no monitor at index {monitor_idx}");
+        }
+
         self.handle_unmanaged_window_behaviour()?;
 
         tracing::info!("moving container");
@@ -1773,6 +1853,12 @@ impl WindowManager {
     #[tracing::instrument(skip(self))]
     pub fn move_workspace_to_monitor(&mut self, idx: usize) -> eyre::Result<()> {
         tracing::info!("moving workspace");
+
+        // check the target before the workspace is taken out of its monitor
+        if idx >= self.monitors().len() {
+            bail!("there is no monitor at index {idx}");
+        }
+
         let mouse_follows_focus = self.mouse_follows_focus;
         let offset = self.work_area_offset;
         let workspace = self
@@ -1943,37 +2029,17 @@ impl WindowManager {
                 _ => workspace_idx,
             };
 
-            self.focus_workspace(next_idx)?;
-
-            if let Ok(focused_workspace) = self.focused_workspace_mut()
-                && focused_workspace.monocle_container.is_none()
-            {
-                match direction {
-                    OperationDirection::Left => match focused_workspace.layout {
-                        Layout::Default(layout) => {
-                            let target_index =
-                                layout.rightmost_index(focused_workspace.containers().len());
-                            focused_workspace.focus_container(target_index);
-                        }
-                        Layout::Custom(_) => {
-                            focused_workspace.focus_container(
-                                focused_workspace.containers().len().saturating_sub(1),
-                            );
-                        }
-                    },
-                    OperationDirection::Right => match focused_workspace.layout {
-                        Layout::Default(layout) => {
-                            let target_index =
-                                layout.leftmost_index(focused_workspace.containers().len());
-                            focused_workspace.focus_container(target_index);
-                        }
-                        Layout::Custom(_) => {
-                            focused_workspace.focus_container(0);
-                        }
-                    },
-                    _ => {}
-                };
-            }
+            // the container at the edge the workspace is entered by is the one that
+            // is focused, which is done before it is laid out and slid in
+            self.focus_workspace_towards(
+                next_idx,
+                SlideDirection::of_operation(direction),
+                |workspace| {
+                    if workspace.monocle_container.is_none() {
+                        focus_container_at_edge(workspace, direction);
+                    }
+                },
+            )?;
 
             return Ok(());
         }
@@ -1999,8 +2065,11 @@ impl WindowManager {
                 match direction {
                     OperationDirection::Left => match focused_workspace.layout {
                         Layout::Default(layout) => {
-                            let target_index =
-                                layout.rightmost_index(focused_workspace.containers().len());
+                            let target_index = direction.cross_boundary_edge_index(
+                                layout,
+                                focused_workspace.containers().len(),
+                                focused_workspace.layout_flip,
+                            );
                             focused_workspace.focus_container(target_index);
                         }
                         Layout::Custom(_) => {
@@ -2011,8 +2080,11 @@ impl WindowManager {
                     },
                     OperationDirection::Right => match focused_workspace.layout {
                         Layout::Default(layout) => {
-                            let target_index =
-                                layout.leftmost_index(focused_workspace.containers().len());
+                            let target_index = direction.cross_boundary_edge_index(
+                                layout,
+                                focused_workspace.containers().len(),
+                                focused_workspace.layout_flip,
+                            );
                             focused_workspace.focus_container(target_index);
                         }
                         Layout::Custom(_) => {
@@ -2110,6 +2182,16 @@ impl WindowManager {
 
         tracing::info!("focusing container");
 
+        if workspace.monocle_container.is_some()
+            && matches!(self.monocle_focus_behaviour, MonocleFocusBehaviour::Cycle)
+        {
+            let cycle_direction = match direction {
+                OperationDirection::Left | OperationDirection::Down => CycleDirection::Previous,
+                OperationDirection::Right | OperationDirection::Up => CycleDirection::Next,
+            };
+            return self.cycle_monocle(cycle_direction);
+        }
+
         let new_idx =
             if workspace.maximized_window.is_some() || workspace.monocle_container.is_some() {
                 None
@@ -2148,37 +2230,17 @@ impl WindowManager {
                 _ => workspace_idx,
             };
 
-            self.focus_workspace(next_idx)?;
-
-            if let Ok(focused_workspace) = self.focused_workspace_mut()
-                && focused_workspace.monocle_container.is_none()
-            {
-                match direction {
-                    OperationDirection::Left => match focused_workspace.layout {
-                        Layout::Default(layout) => {
-                            let target_index =
-                                layout.rightmost_index(focused_workspace.containers().len());
-                            focused_workspace.focus_container(target_index);
-                        }
-                        Layout::Custom(_) => {
-                            focused_workspace.focus_container(
-                                focused_workspace.containers().len().saturating_sub(1),
-                            );
-                        }
-                    },
-                    OperationDirection::Right => match focused_workspace.layout {
-                        Layout::Default(layout) => {
-                            let target_index =
-                                layout.leftmost_index(focused_workspace.containers().len());
-                            focused_workspace.focus_container(target_index);
-                        }
-                        Layout::Custom(_) => {
-                            focused_workspace.focus_container(0);
-                        }
-                    },
-                    _ => {}
-                };
-            }
+            // the container at the edge the workspace is entered by is the one that
+            // is focused, which is done before it is laid out and slid in
+            self.focus_workspace_towards(
+                next_idx,
+                SlideDirection::of_operation(direction),
+                |workspace| {
+                    if workspace.monocle_container.is_none() {
+                        focus_container_at_edge(workspace, direction);
+                    }
+                },
+            )?;
 
             return Ok(());
         }
@@ -2206,8 +2268,11 @@ impl WindowManager {
                         match direction {
                             OperationDirection::Left => match focused_workspace.layout {
                                 Layout::Default(layout) => {
-                                    let target_index = layout
-                                        .rightmost_index(focused_workspace.containers().len());
+                                    let target_index = direction.cross_boundary_edge_index(
+                                        layout,
+                                        focused_workspace.containers().len(),
+                                        focused_workspace.layout_flip,
+                                    );
                                     focused_workspace.focus_container(target_index);
                                 }
                                 Layout::Custom(_) => {
@@ -2218,8 +2283,11 @@ impl WindowManager {
                             },
                             OperationDirection::Right => match focused_workspace.layout {
                                 Layout::Default(layout) => {
-                                    let target_index =
-                                        layout.leftmost_index(focused_workspace.containers().len());
+                                    let target_index = direction.cross_boundary_edge_index(
+                                        layout,
+                                        focused_workspace.containers().len(),
+                                        focused_workspace.layout_flip,
+                                    );
                                     focused_workspace.focus_container(target_index);
                                 }
                                 Layout::Custom(_) => {
@@ -2508,8 +2576,13 @@ impl WindowManager {
             }
             Some(new_idx) => {
                 let workspace = self.focused_workspace_mut()?;
-                workspace.swap_containers(origin_container_idx, new_idx);
-                workspace.focus_container(new_idx);
+
+                // a column of the Scrolling layout moves whole, and its tiles move within it,
+                // which is not a swap of two containers
+                if !(workspace.is_scrolling() && workspace.move_scrolling(direction)) {
+                    workspace.swap_containers(origin_container_idx, new_idx);
+                    workspace.focus_container(new_idx);
+                }
             }
         }
 
@@ -2949,8 +3022,7 @@ impl WindowManager {
 
         let target_idx = match &workspace.layout {
             Layout::Default(_) => 0,
-            Layout::Custom(custom) => custom
-                .first_container_idx(custom.primary_idx().map_or(0, |primary_idx| primary_idx)),
+            Layout::Custom(custom) => custom.first_container_idx(custom.primary_idx().unwrap_or(0)),
         };
 
         workspace.focus_container(target_idx);
@@ -3101,6 +3173,27 @@ impl WindowManager {
     }
 
     #[tracing::instrument(skip(self))]
+    pub fn cycle_monocle(&mut self, direction: CycleDirection) -> eyre::Result<()> {
+        tracing::info!("cycling monocle container");
+
+        if self.focused_workspace()?.containers().is_empty() {
+            return Ok(());
+        }
+
+        self.focused_workspace_mut()?
+            .cycle_monocle_container(direction)?;
+
+        for container in self.focused_workspace_mut()?.containers_mut() {
+            container.hide(None);
+        }
+
+        // borders were getting funny during cycles, can't be bothered to root cause it
+        border_manager::destroy_all_borders()?;
+
+        self.update_focused_workspace(true, true)
+    }
+
+    #[tracing::instrument(skip(self))]
     pub fn toggle_maximize(&mut self) -> eyre::Result<()> {
         self.handle_unmanaged_window_behaviour()?;
 
@@ -3177,15 +3270,7 @@ impl WindowManager {
     pub fn change_workspace_layout_default(&mut self, layout: DefaultLayout) -> eyre::Result<()> {
         tracing::info!("changing layout");
 
-        let monitor_count = self.monitors().len();
         let workspace = self.focused_workspace_mut()?;
-
-        if monitor_count > 1 && matches!(layout, DefaultLayout::Scrolling) {
-            tracing::warn!(
-                "scrolling layout is only supported for a single monitor; not changing layout"
-            );
-            return Ok(());
-        }
 
         match &workspace.layout {
             Layout::Default(_) => {}
@@ -3746,14 +3831,51 @@ impl WindowManager {
 
     #[tracing::instrument(skip(self))]
     pub fn focus_workspace(&mut self, idx: usize) -> eyre::Result<()> {
+        let direction = self
+            .focused_monitor()
+            .and_then(|monitor| SlideDirection::between(monitor.focused_workspace_idx(), idx));
+
+        self.focus_workspace_towards(idx, direction, |_| {})
+    }
+
+    /// Focus the workspace at `idx` on the focused monitor, and slide the windows
+    /// of the workspace that is left out of the monitor and those of this one in
+    /// from `direction`, if workspaces are slid and there is a direction.
+    ///
+    /// `prepare` is given the workspace before it is shown, to focus what is to
+    /// be in focus on it, which cannot be left until it is laid out.
+    pub fn focus_workspace_towards(
+        &mut self,
+        idx: usize,
+        direction: Option<SlideDirection>,
+        prepare: impl FnOnce(&mut Workspace),
+    ) -> eyre::Result<()> {
         tracing::info!("focusing workspace");
 
         let mouse_follows_focus = self.mouse_follows_focus;
+
+        // the windows that slide are animated together, when everything that
+        // is to be done to them has been, and whatever is not animated by then
+        // is hidden or shown at once, which is done first
+        let _animations = AnimationBatch::begin();
+        let _pending = transition::PendingGuard;
+
         let monitor = self
             .focused_monitor_mut()
             .ok_or_eyre("there is no workspace")?;
 
+        if let Some(direction) = direction
+            && let Some(plan) = workspace_transition_plan(monitor, idx, direction)
+        {
+            transition::start(&plan);
+        }
+
         monitor.focus_workspace(idx)?;
+
+        if let Some(workspace) = monitor.focused_workspace_mut() {
+            prepare(workspace);
+        }
+
         monitor.load_focused_workspace(mouse_follows_focus)?;
 
         self.update_focused_workspace(false, true)
@@ -3880,6 +4002,82 @@ impl WindowManager {
             self.known_hwnds = known_hwnds;
         }
     }
+}
+
+/// Focus the container of a workspace that is next to the edge it is entered
+/// by when moving in `direction`: the last one when moving left and the first
+/// one when moving right
+fn focus_container_at_edge(workspace: &mut Workspace, direction: OperationDirection) {
+    let target_index = match (direction, &workspace.layout) {
+        (OperationDirection::Left | OperationDirection::Right, Layout::Default(layout)) => {
+            direction.cross_boundary_edge_index(
+                *layout,
+                workspace.containers().len(),
+                workspace.layout_flip,
+            )
+        }
+        (OperationDirection::Left, Layout::Custom(_)) => {
+            workspace.containers().len().saturating_sub(1)
+        }
+        (OperationDirection::Right, Layout::Custom(_)) => 0,
+        _ => return,
+    };
+
+    workspace.focus_container(target_index);
+}
+
+/// What to slide when the monitor goes from its workspace to the one at `idx`,
+/// if anything is: not when workspaces are not slid, or either has a window
+/// that is maximized, which the monitor is not shown as it is laid out, or
+/// when windows are not hidden by cloaking them, which a picture cannot be
+/// taken of
+fn workspace_transition_plan(
+    monitor: &Monitor,
+    idx: usize,
+    direction: SlideDirection,
+) -> Option<transition::Plan> {
+    if !workspace_transitions_enabled()
+        || !matches!(*HIDING_BEHAVIOUR.lock(), HidingBehaviour::Cloak)
+        || idx == monitor.focused_workspace_idx()
+    {
+        return None;
+    }
+
+    let leaving = monitor.focused_workspace()?;
+    let entering = monitor.workspaces().get(idx)?;
+
+    if leaving.maximized_window.is_some() || entering.maximized_window.is_some() {
+        return None;
+    }
+
+    let outgoing: Vec<(isize, Rect)> = leaving
+        .windows_on_show()
+        .into_iter()
+        .filter(|window| !window.is_miminized())
+        .filter_map(|window| {
+            WindowsApi::window_rect(window.hwnd)
+                .ok()
+                .map(|rect| (window.hwnd, rect))
+        })
+        .collect();
+
+    let incoming: Vec<isize> = entering
+        .windows_on_show()
+        .into_iter()
+        .map(|window| window.hwnd)
+        .collect();
+
+    let plan = transition::plan(direction, monitor.size, &outgoing, &incoming)?;
+
+    // the borders of the windows that slide are drawn into their ghosts
+    border_manager::set_ghost_kinds(
+        leaving
+            .border_kinds_on_show()
+            .into_iter()
+            .chain(entering.border_kinds_on_show()),
+    );
+
+    Some(plan)
 }
 
 #[cfg(test)]
@@ -6001,5 +6199,102 @@ mod tests {
         assert_eq!(op.target_monitor_idx, target_monitor_idx); // 2
         assert_eq!(op.target_workspace_idx, target_workspace_idx); // 3
         assert_eq!(op.floating, floating); // false
+    }
+
+    fn monitor_with_containers(containers: usize) -> Monitor {
+        let mut m = monitor::new(
+            0,
+            Rect::default(),
+            Rect::default(),
+            "TestMonitor".to_string(),
+            "TestDevice".to_string(),
+            "TestDeviceID".to_string(),
+            Some("TestMonitorID".to_string()),
+        );
+
+        for _ in 0..containers {
+            m.focused_workspace_mut()
+                .unwrap()
+                .containers_mut()
+                .push_back(Container::default());
+        }
+
+        m
+    }
+
+    #[test]
+    fn test_move_container_to_missing_monitor_keeps_the_container() {
+        let (mut wm, _context) = setup_window_manager();
+        wm.monitors_mut().push_back(monitor_with_containers(3));
+
+        assert!(wm.move_container_to_monitor(7, None, false, None).is_err());
+        assert!(
+            wm.move_container_to_monitor(7, Some(1), true, None)
+                .is_err()
+        );
+
+        assert_eq!(wm.focused_workspace().unwrap().containers().len(), 3);
+    }
+
+    #[test]
+    fn test_move_workspace_to_missing_monitor_keeps_the_workspace() {
+        let (mut wm, _context) = setup_window_manager();
+        wm.monitors_mut().push_back(monitor_with_containers(3));
+
+        assert!(wm.move_workspace_to_monitor(7).is_err());
+
+        assert_eq!(wm.focused_monitor().unwrap().workspaces().len(), 1);
+        assert_eq!(wm.focused_workspace().unwrap().containers().len(), 3);
+    }
+
+    /// What dragging the edge that two stacked tiles share, from either of them, gives the
+    /// tile that is dragged: three tiles laid out as BSP, one on the left and two on the right
+    fn dragged_dimensions(
+        focused: usize,
+        edge: OperationDirection,
+        sizing: Sizing,
+    ) -> Vec<Option<Rect>> {
+        let (mut wm, _context) = setup_window_manager();
+        let area = Rect {
+            left: 0,
+            top: 0,
+            right: 1000,
+            bottom: 800,
+        };
+        let mut monitor = monitor::new(
+            0,
+            area,
+            area,
+            "TestMonitor".to_string(),
+            "TestDevice".to_string(),
+            "TestDeviceID".to_string(),
+            Some("TestMonitorID".to_string()),
+        );
+
+        let workspace = monitor.focused_workspace_mut().unwrap();
+        workspace.layout = Layout::Default(DefaultLayout::BSP);
+        for _ in 0..3 {
+            workspace.containers_mut().push_back(Container::default());
+        }
+        workspace.resize_dimensions = vec![None; 3];
+        workspace.focus_container(focused);
+
+        wm.monitors_mut().push_back(monitor);
+        wm.resize_window(edge, sizing, 144, false).unwrap();
+
+        wm.focused_workspace().unwrap().resize_dimensions.clone()
+    }
+
+    #[test]
+    fn test_resize_the_top_edge_of_the_lower_tile() {
+        let dragged_up = dragged_dimensions(2, OperationDirection::Up, Sizing::Increase);
+        assert!(
+            dragged_up[2].is_some() || dragged_up[1].is_some(),
+            "dragging the top edge of the lower tile up changed nothing: {dragged_up:?}"
+        );
+
+        // the same edge from the tile above
+        let dragged_down = dragged_dimensions(1, OperationDirection::Down, Sizing::Increase);
+        assert!(dragged_down[1].is_some(), "{dragged_down:?}");
     }
 }

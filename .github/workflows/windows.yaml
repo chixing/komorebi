@@ -41,6 +41,10 @@ jobs:
           cache-on-failure: "true"
           cache-all-crates: "true"
           key: validate-${{ env.RUST_VERSION }}
+      - name: Check that no file is stored with CRLF
+        run: |
+          $crlf = git ls-files --eol | Select-String -Pattern '^i/crlf'
+          if ($crlf) { $crlf; exit 1 }
       - name: Check formatting
         run: cargo +${{ env.RUSTFMT_VERSION }} fmt --check
       - name: Run Clippy

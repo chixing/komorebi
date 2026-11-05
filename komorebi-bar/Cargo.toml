@@ -1,6 +1,6 @@
 [package]
 name = "komorebi-bar"
-version = "0.1.41"
+version = "0.1.42"
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -23,7 +23,7 @@ font-loader = "0.11"
 hotwatch = { workspace = true }
 image = "0.25"
 lazy_static = { workspace = true }
-netdev = "0.41"
+netdev = "0.46"
 num = "0.4"
 num-derive = "0.4"
 num-traits = "0.2"
@@ -34,7 +34,7 @@ reqwest = { version = "0.12", features = ["blocking"] }
 schemars = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-starship-battery = "0.10"
+starship-battery = "0.11"
 sysinfo = { workspace = true }
 systray-util = "0.2.0"
 tokio = { version = "1", features = ["rt", "sync", "time"] }

@@ -24,6 +24,7 @@ use windows::Win32::Foundation::WPARAM;
 use windows::Win32::Graphics::Dwm::DWM_CLOAKED_APP;
 use windows::Win32::Graphics::Dwm::DWM_CLOAKED_INHERITED;
 use windows::Win32::Graphics::Dwm::DWM_CLOAKED_SHELL;
+use windows::Win32::Graphics::Dwm::DWM_THUMBNAIL_PROPERTIES;
 use windows::Win32::Graphics::Dwm::DWMWA_BORDER_COLOR;
 use windows::Win32::Graphics::Dwm::DWMWA_CLOAKED;
 use windows::Win32::Graphics::Dwm::DWMWA_COLOR_NONE;
@@ -32,7 +33,10 @@ use windows::Win32::Graphics::Dwm::DWMWA_WINDOW_CORNER_PREFERENCE;
 use windows::Win32::Graphics::Dwm::DWMWCP_ROUND;
 use windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE;
 use windows::Win32::Graphics::Dwm::DwmGetWindowAttribute;
+use windows::Win32::Graphics::Dwm::DwmRegisterThumbnail;
 use windows::Win32::Graphics::Dwm::DwmSetWindowAttribute;
+use windows::Win32::Graphics::Dwm::DwmUnregisterThumbnail;
+use windows::Win32::Graphics::Dwm::DwmUpdateThumbnailProperties;
 use windows::Win32::Graphics::Gdi::CreateSolidBrush;
 use windows::Win32::Graphics::Gdi::EnumDisplayMonitors;
 use windows::Win32::Graphics::Gdi::GetMonitorInfoW;
@@ -165,6 +169,7 @@ use crate::WindowManager;
 use crate::container::Container;
 use crate::monitor;
 use crate::monitor::Monitor;
+use crate::monitor_reconciliator::same_device;
 use crate::ring::Ring;
 use crate::set_window_position::SetWindowPosition;
 use crate::windows_callbacks;
@@ -256,6 +261,22 @@ impl WindowsApi {
             .process()
     }
 
+    /// The rectangle of every monitor that is attached.
+    pub fn monitor_rects() -> Vec<Rect> {
+        let mut rects: Vec<Rect> = vec![];
+
+        if Self::enum_display_monitors(
+            Some(windows_callbacks::enum_monitor_rects),
+            &raw mut rects as isize,
+        )
+        .is_err()
+        {
+            tracing::warn!("could not enumerate the monitors");
+        }
+
+        rects
+    }
+
     pub fn valid_hmonitors() -> eyre::Result<Vec<(String, isize)>> {
         Ok(win32_display_data::connected_displays_all()
             .flatten()
@@ -313,7 +334,7 @@ impl WindowsApi {
             let name = name.split('\\').collect::<Vec<_>>()[0].to_string();
 
             for monitor in monitors.elements() {
-                if device_id.eq(&monitor.device_id) {
+                if same_device((&device_id, &name), (&monitor.device_id, &monitor.name)) {
                     continue 'read;
                 }
             }
@@ -585,12 +606,26 @@ impl WindowsApi {
         )
     }
 
-    pub fn set_border_pos(hwnd: isize, layout: &Rect, position: isize) -> eyre::Result<()> {
-        // Our border windows must resize synchronously before the D2D render target is resized and drawn.
-        let flags = SetWindowPosition::NO_SEND_CHANGING
+    pub fn set_border_pos(
+        hwnd: isize,
+        layout: &Rect,
+        position: isize,
+        show: bool,
+    ) -> eyre::Result<()> {
+        let mut flags = SetWindowPosition::NO_SEND_CHANGING
             | SetWindowPosition::NO_ACTIVATE
-            | SetWindowPosition::NO_REDRAW
-            | SetWindowPosition::SHOW_WINDOW;
+            | SetWindowPosition::NO_REDRAW;
+
+        if show {
+            flags |= SetWindowPosition::SHOW_WINDOW;
+        }
+
+        if matches!(
+            WINDOW_HANDLING_BEHAVIOUR.load(),
+            WindowHandlingBehaviour::Async
+        ) {
+            flags |= SetWindowPosition::ASYNC_WINDOW_POS;
+        }
 
         Self::set_window_pos(
             HWND(as_ptr!(hwnd)),
@@ -1335,6 +1370,21 @@ impl WindowsApi {
             )?;
             Ok(alpha)
         }
+    }
+
+    pub fn dwm_register_thumbnail(dest_hwnd: isize, src_hwnd: isize) -> eyre::Result<isize> {
+        Ok(unsafe { DwmRegisterThumbnail(HWND(as_ptr!(dest_hwnd)), HWND(as_ptr!(src_hwnd))) }?)
+    }
+
+    pub fn dwm_update_thumbnail_properties(
+        hthumb: isize,
+        props: &DWM_THUMBNAIL_PROPERTIES,
+    ) -> eyre::Result<()> {
+        unsafe { DwmUpdateThumbnailProperties(hthumb, props) }.map_err(Into::into)
+    }
+
+    pub fn dwm_unregister_thumbnail(hthumb: isize) -> eyre::Result<()> {
+        unsafe { DwmUnregisterThumbnail(hthumb) }.map_err(Into::into)
     }
 
     pub fn create_hidden_window(name: PCWSTR, instance: isize) -> eyre::Result<isize> {

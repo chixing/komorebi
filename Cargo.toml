@@ -6,6 +6,7 @@ members = [
   "komorebi-client",
   "komorebi-gui",
   "komorebi-layouts",
+  "komorebi-scrolling",
   "komorebic",
   "komorebic-no-console",
   "komorebi-bar",
@@ -36,14 +37,14 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 parking_lot = "0.12"
 paste = "1"
-sysinfo = "0.38"
+sysinfo = "0.39"
 uds_windows = "1"
 win32-display-data = { git = "https://github.com/LGUG2Z/win32-display-data", rev = "8c42d8db257d30fe95bc98c2e5cd8f75da861021" }
 windows-numerics = { version = "0.3" }
 windows-implement = { version = "0.60" }
 windows-interface = { version = "0.59" }
 windows-core = { version = "0.62" }
-shadow-rs = "1"
+shadow-rs = "2"
 which = "8"
 
 [workspace.dependencies.windows]
@@ -58,6 +59,7 @@ features = [
   "Win32_Globalization",
   "Win32_Graphics_Dwm",
   "Win32_Graphics_Gdi",
+  "Win32_Storage_Xps",
   "Win32_Graphics_Direct2D",
   "Win32_Graphics_Direct2D_Common",
   "Win32_Graphics_Dxgi_Common",

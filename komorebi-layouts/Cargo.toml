@@ -1,9 +1,10 @@
 [package]
 name = "komorebi-layouts"
-version = "0.1.41"
+version = "0.1.42"
 edition = "2024"
 
 [dependencies]
+komorebi-scrolling = { path = "../komorebi-scrolling" }
 clap = { workspace = true }
 color-eyre = { workspace = true }
 serde = { workspace = true }

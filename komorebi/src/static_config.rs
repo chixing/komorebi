@@ -39,6 +39,8 @@ use crate::animation::ANIMATION_FPS;
 use crate::animation::ANIMATION_STYLE_GLOBAL;
 use crate::animation::ANIMATION_STYLE_PER_ANIMATION;
 use crate::animation::DEFAULT_ANIMATION_FPS;
+use crate::animation::DEFAULT_GHOST_MOVEMENT;
+use crate::animation::GHOST_MOVEMENT_ENABLED;
 use crate::animation::PerAnimationPrefixConfig;
 use crate::asc::ApplicationSpecificConfiguration;
 use crate::asc::AscApplicationRulesOrSchema;
@@ -53,9 +55,11 @@ use crate::core::BorderStyle;
 use crate::core::DefaultLayout;
 use crate::core::FocusFollowsMouseImplementation;
 use crate::core::HidingBehaviour;
+use crate::core::InitialWindowPlacementRules;
 use crate::core::Layout;
 use crate::core::LayoutDefaultEntry;
 use crate::core::LayoutOptions;
+use crate::core::MonocleFocusBehaviour;
 use crate::core::MoveBehaviour;
 use crate::core::OperationBehaviour;
 use crate::core::Rect;
@@ -283,6 +287,11 @@ pub struct WorkspaceConfig {
     /// Specify a wallpaper for this workspace
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wallpaper: Option<Wallpaper>,
+    /// Initial window placement rules that determine where new tiled windows are placed
+    /// in the container list. Can be a placement target (a `WindowPlacement` string like
+    /// `"Primary"` or a 1-based container index), or a map of placement targets to matching rules.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_window_placement_rules: Option<InitialWindowPlacementRules>,
 }
 
 impl From<&Workspace> for WorkspaceConfig {
@@ -386,6 +395,7 @@ impl From<&Workspace> for WorkspaceConfig {
             layout_flip: value.layout_flip,
             floating_layer_behaviour: value.floating_layer_behaviour,
             wallpaper: None,
+            initial_window_placement_rules: value.initial_window_placement_rules.clone(),
         }
     }
 }
@@ -475,7 +485,7 @@ pub enum AppSpecificConfigurationPath {
 #[serde_with::serde_as]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-/// The `komorebi.json` static configuration file reference for `v0.1.41`
+/// The `komorebi.json` static configuration file reference for `v0.1.42`
 pub struct StaticConfig {
     /// DEPRECATED from v0.1.22: no longer required
     #[deprecated(note = "No longer required")]
@@ -527,6 +537,10 @@ pub struct StaticConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(extend("default" = CrossBoundaryBehaviour::Monitor)))]
     pub cross_boundary_behaviour: Option<CrossBoundaryBehaviour>,
+    /// Determine what happens when focusing in a direction while a monocle container is active
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(extend("default" = MonocleFocusBehaviour::NoOp)))]
+    pub monocle_focus_behaviour: Option<MonocleFocusBehaviour>,
     /// Determine what happens when commands are sent while an unmanaged window is in the foreground
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(extend("default" = OperationBehaviour::Op)))]
@@ -695,6 +709,11 @@ pub struct AnimationsConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(extend("default" = ANIMATION_FPS)))]
     pub fps: Option<u64>,
+    /// Render movement animations on a GPU-composited ghost surface (recommended).
+    /// When false, falls back to the legacy per-frame MoveWindow path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(extend("default" = false)))]
+    pub ghost_movement: Option<bool>,
 }
 
 pub use komorebi_themes::KomorebiTheme;
@@ -879,6 +898,7 @@ impl From<&WindowManager> for StaticConfig {
             ),
             cross_monitor_move_behaviour: Option::from(value.cross_monitor_move_behaviour),
             cross_boundary_behaviour: Option::from(value.cross_boundary_behaviour),
+            monocle_focus_behaviour: Option::from(value.monocle_focus_behaviour),
             unmanaged_window_operation_behaviour: Option::from(
                 value.unmanaged_window_operation_behaviour,
             ),
@@ -1022,6 +1042,17 @@ impl StaticConfig {
                 animations.fps.unwrap_or(DEFAULT_ANIMATION_FPS),
                 Ordering::SeqCst,
             );
+
+            let ghost_movement_enabled =
+                animations.ghost_movement.unwrap_or(DEFAULT_GHOST_MOVEMENT);
+            GHOST_MOVEMENT_ENABLED.store(ghost_movement_enabled, Ordering::SeqCst);
+            if ghost_movement_enabled {
+                // Spawn the ghost owner thread now so the first animation
+                // doesn't pay the spawn + wndclass-registration cost. Lazy
+                // guarantee preserved: users who turn ghost_movement off
+                // never trigger this path, so the thread is never created.
+                crate::animation::ghost::prewarm();
+            }
         }
 
         if let Some(container) = self.default_container_padding {
@@ -1330,6 +1361,7 @@ impl StaticConfig {
             cross_boundary_behaviour: value
                 .cross_boundary_behaviour
                 .unwrap_or(CrossBoundaryBehaviour::Monitor),
+            monocle_focus_behaviour: value.monocle_focus_behaviour.unwrap_or_default(),
             unmanaged_window_operation_behaviour: value
                 .unmanaged_window_operation_behaviour
                 .unwrap_or(OperationBehaviour::Op),
@@ -1387,8 +1419,6 @@ impl StaticConfig {
         workspace_matching_rules.clear();
         drop(workspace_matching_rules);
 
-        let monitor_count = wm.monitors().len();
-
         let offset = wm.work_area_offset;
         for (i, monitor) in wm.monitors_mut().iter_mut().enumerate() {
             let preferred_config_idx = {
@@ -1437,15 +1467,6 @@ impl StaticConfig {
                 monitor.update_workspaces_globals(offset);
                 for (j, ws) in monitor.workspaces_mut().iter_mut().enumerate() {
                     if let Some(workspace_config) = monitor_config.workspaces.get_mut(j) {
-                        if monitor_count > 1
-                            && matches!(workspace_config.layout, Some(DefaultLayout::Scrolling))
-                        {
-                            tracing::warn!(
-                                "scrolling layout is only supported for a single monitor; falling back to columns layout"
-                            );
-                            workspace_config.layout = Some(DefaultLayout::Columns);
-                        }
-
                         ws.load_static_config(workspace_config, value.layout_defaults.as_ref())?;
                     }
                 }
@@ -1731,6 +1752,7 @@ impl StaticConfig {
             value.float_rule_placement.unwrap_or(Placement::None);
         wm.cross_monitor_move_behaviour = value.cross_monitor_move_behaviour.unwrap_or_default();
         wm.cross_boundary_behaviour = value.cross_boundary_behaviour.unwrap_or_default();
+        wm.monocle_focus_behaviour = value.monocle_focus_behaviour.unwrap_or_default();
         wm.unmanaged_window_operation_behaviour = value
             .unmanaged_window_operation_behaviour
             .unwrap_or_default();
@@ -1753,7 +1775,6 @@ impl StaticConfig {
         };
 
         let monitor_count = wm.monitors().len();
-
         for i in 0..monitor_count {
             wm.update_focused_workspace_by_monitor_idx(i)?;
             let ws_idx = wm.focused_workspace_idx_for_monitor_idx(i)?;

@@ -21,10 +21,13 @@ use crate::animation::ANIMATION_STYLE_GLOBAL;
 use crate::animation::ANIMATION_STYLE_PER_ANIMATION;
 use crate::animation::AnimationEngine;
 use crate::animation::RenderDispatcher;
+use crate::animation::ghost_dispatcher::GhostDispatcher;
 use crate::animation::lerp::Lerp;
 use crate::animation::prefix::AnimationPrefix;
 use crate::animation::prefix::new_animation_key;
+use crate::animation::transition;
 use crate::border_manager;
+use crate::cloaked;
 use crate::com::SetCloak;
 use crate::core::ApplicationIdentifier;
 use crate::core::HidingBehaviour;
@@ -32,8 +35,7 @@ use crate::core::Rect;
 use crate::core::config_generation::IdWithIdentifier;
 use crate::core::config_generation::MatchingRule;
 use crate::core::config_generation::MatchingStrategy;
-use crate::focus_manager;
-use crate::stackbar_manager;
+use crate::live_resize;
 use crate::styles::ExtendedWindowStyle;
 use crate::styles::WindowStyle;
 use crate::transparency_manager;
@@ -156,80 +158,6 @@ impl Serialize for Window {
             &WindowsApi::window_rect(self.hwnd).unwrap_or_default(),
         )?;
         state.end()
-    }
-}
-
-struct MovementRenderDispatcher {
-    hwnd: isize,
-    start_rect: Rect,
-    target_rect: Rect,
-    top: bool,
-    style: AnimationStyle,
-}
-
-impl MovementRenderDispatcher {
-    const PREFIX: AnimationPrefix = AnimationPrefix::Movement;
-
-    pub fn new(
-        hwnd: isize,
-        start_rect: Rect,
-        target_rect: Rect,
-        top: bool,
-        style: AnimationStyle,
-    ) -> Self {
-        Self {
-            hwnd,
-            start_rect,
-            target_rect,
-            top,
-            style,
-        }
-    }
-}
-
-impl RenderDispatcher for MovementRenderDispatcher {
-    fn get_animation_key(&self) -> String {
-        new_animation_key(MovementRenderDispatcher::PREFIX, self.hwnd.to_string())
-    }
-
-    fn pre_render(&self) -> eyre::Result<()> {
-        stackbar_manager::STACKBAR_TEMPORARILY_DISABLED.store(true, Ordering::SeqCst);
-        stackbar_manager::send_notification();
-
-        Ok(())
-    }
-
-    fn render(&self, progress: f64) -> eyre::Result<()> {
-        let new_rect = self.start_rect.lerp(self.target_rect, progress, self.style);
-
-        // we don't check WINDOW_HANDLING_BEHAVIOUR here because animations
-        // are always run on a separate thread
-        WindowsApi::move_window(self.hwnd, &new_rect, false)?;
-        WindowsApi::invalidate_rect(self.hwnd, None, false);
-
-        Ok(())
-    }
-
-    fn post_render(&self) -> eyre::Result<()> {
-        // we don't add the async_window_pos flag here because animations
-        // are always run on a separate thread
-        WindowsApi::position_window(self.hwnd, &self.target_rect, self.top, false)?;
-        if ANIMATION_MANAGER
-            .lock()
-            .count_in_progress(MovementRenderDispatcher::PREFIX)
-            == 0
-        {
-            if WindowsApi::foreground_window().unwrap_or_default() == self.hwnd {
-                focus_manager::send_notification(self.hwnd)
-            }
-
-            stackbar_manager::STACKBAR_TEMPORARILY_DISABLED.store(false, Ordering::SeqCst);
-
-            stackbar_manager::send_notification();
-            transparency_manager::send_notification();
-        }
-
-        Ok(())
     }
 }
 
@@ -379,14 +307,14 @@ impl Window {
             windows_api::WindowsApi::unmaximize_window(self.hwnd);
             let animation_enabled = ANIMATION_ENABLED_PER_ANIMATION.lock();
             let move_enabled = animation_enabled
-                .get(&MovementRenderDispatcher::PREFIX)
+                .get(&GhostDispatcher::PREFIX)
                 .is_some_and(|v| *v);
             drop(animation_enabled);
 
             if move_enabled || ANIMATION_ENABLED_GLOBAL.load(Ordering::SeqCst) {
                 let anim_count = ANIMATION_MANAGER
                     .lock()
-                    .count_in_progress(MovementRenderDispatcher::PREFIX);
+                    .count_in_progress(GhostDispatcher::PREFIX);
                 self.set_position(&new_rect, true)?;
                 let hwnd = self.hwnd;
                 // Wait for the animation to finish before maximizing the window again, otherwise
@@ -394,13 +322,13 @@ impl Window {
                 thread::spawn(move || {
                     let mut new_anim_count = ANIMATION_MANAGER
                         .lock()
-                        .count_in_progress(MovementRenderDispatcher::PREFIX);
+                        .count_in_progress(GhostDispatcher::PREFIX);
                     let mut max_wait = 2000; // Max waiting time. No one will be using an animation longer than 2s, right? RIGHT??? WHY?
                     while new_anim_count > anim_count && max_wait > 0 {
                         thread::sleep(Duration::from_millis(10));
                         new_anim_count = ANIMATION_MANAGER
                             .lock()
-                            .count_in_progress(MovementRenderDispatcher::PREFIX);
+                            .count_in_progress(GhostDispatcher::PREFIX);
                         max_wait -= 1;
                     }
                     windows_api::WindowsApi::maximize_window(hwnd);
@@ -444,14 +372,83 @@ impl Window {
     }
 
     pub fn set_position(&self, layout: &Rect, top: bool) -> eyre::Result<()> {
-        let window_rect = WindowsApi::window_rect(self.hwnd)?;
+        // a window of the workspace that has been switched to slides in from the
+        // side of the monitor, which is so even if it is where the layout puts it
+        // already, as it was when it was hidden
+        if let Some(slid) = transition::slide_in(*self, layout, top) {
+            return slid;
+        }
 
-        if window_rect.eq(layout) {
+        // and it is put where it goes by that animation, which a layout that is
+        // done while it is on its way is not to cancel
+        if transition::is_sliding_in(self.hwnd) {
             return Ok(());
         }
 
+        // a window that the user has hold of by an edge is where they put it, until
+        // they let go
+        if live_resize::is_dragging(self.hwnd) {
+            return Ok(());
+        }
+
+        let window_rect = WindowsApi::window_rect(self.hwnd)?;
+
+        if window_rect.eq(layout) {
+            if live_resize::is_stepping() {
+                tracing::debug!(
+                    "live resize: hwnd {} is where it is to be, {layout:?}",
+                    self.hwnd
+                );
+                live_resize::follow(self.hwnd, &window_rect, layout);
+            }
+
+            return Ok(());
+        }
+
+        // the neighbours of a window being dragged follow it as it goes, which is
+        // not to be seen catching up
+        if live_resize::is_stepping() {
+            // what a window that is resized is seen to do is covered: the cover is where the
+            // window is to be, which is the pointer's, and the window is sent there when
+            // the drag is over
+            if live_resize::follow(self.hwnd, &window_rect, layout) {
+                return Ok(());
+            }
+
+            if live_resize::is_catching_up(self.hwnd, layout) {
+                tracing::debug!(
+                    "live resize: hwnd {} is at {window_rect:?}, not yet where it was sent, left alone for {layout:?}",
+                    self.hwnd
+                );
+                return Ok(());
+            }
+
+            tracing::debug!(
+                "live resize: hwnd {} sent to {layout:?} from {window_rect:?} ({})",
+                self.hwnd,
+                if live_resize::is_pacing() {
+                    "step"
+                } else {
+                    "end"
+                }
+            );
+            live_resize::sent(self.hwnd, layout);
+            return WindowsApi::position_window(self.hwnd, layout, top, true);
+        }
+
+        // a command that resizes windows puts them where they go at once: one that is on its
+        // way somewhere is stopped where it is, first
+        if live_resize::is_in_place() {
+            let key = new_animation_key(GhostDispatcher::PREFIX, self.hwnd.to_string());
+            if ANIMATION_MANAGER.lock().in_progress(&key) {
+                AnimationEngine::cancel(&key);
+            }
+
+            return WindowsApi::position_window(self.hwnd, layout, top, true);
+        }
+
         let animation_enabled = ANIMATION_ENABLED_PER_ANIMATION.lock();
-        let move_enabled = animation_enabled.get(&MovementRenderDispatcher::PREFIX);
+        let move_enabled = animation_enabled.get(&GhostDispatcher::PREFIX);
 
         if move_enabled.is_some_and(|enabled| *enabled)
             || ANIMATION_ENABLED_GLOBAL.load(Ordering::SeqCst)
@@ -459,16 +456,16 @@ impl Window {
             let duration = Duration::from_millis(
                 *ANIMATION_DURATION_PER_ANIMATION
                     .lock()
-                    .get(&MovementRenderDispatcher::PREFIX)
+                    .get(&GhostDispatcher::PREFIX)
                     .unwrap_or(&ANIMATION_DURATION_GLOBAL.load(Ordering::SeqCst)),
             );
             let style = *ANIMATION_STYLE_PER_ANIMATION
                 .lock()
-                .get(&MovementRenderDispatcher::PREFIX)
+                .get(&GhostDispatcher::PREFIX)
                 .unwrap_or(&ANIMATION_STYLE_GLOBAL.lock());
 
             let render_dispatcher =
-                MovementRenderDispatcher::new(self.hwnd, window_rect, *layout, top, style);
+                GhostDispatcher::new(self.hwnd, window_rect, *layout, top, style);
 
             AnimationEngine::animate(render_dispatcher, duration)
         } else {
@@ -489,6 +486,12 @@ impl Window {
     }
 
     pub fn hide_with_border(self, hide_border: bool) {
+        // a workspace that is sliding out hides its windows itself, when their
+        // ghosts are up
+        if transition::is_exiting(self.hwnd) {
+            return;
+        }
+
         let mut programmatically_hidden_hwnds = HIDDEN_HWNDS.lock();
         if !programmatically_hidden_hwnds.contains(&self.hwnd) {
             programmatically_hidden_hwnds.push(self.hwnd);
@@ -500,7 +503,10 @@ impl Window {
         match *hiding_behaviour {
             HidingBehaviour::Hide => WindowsApi::hide_window(self.hwnd),
             HidingBehaviour::Minimize => WindowsApi::minimize_window(self.hwnd),
-            HidingBehaviour::Cloak => SetCloak(self.hwnd(), 1, 2),
+            HidingBehaviour::Cloak => {
+                SetCloak(self.hwnd(), 1, 2);
+                cloaked::record(&programmatically_hidden_hwnds);
+            }
         }
         if hide_border {
             border_manager::hide_border(self.hwnd);
@@ -512,6 +518,12 @@ impl Window {
     }
 
     pub fn restore_with_border(self, restore_border: bool) {
+        // a workspace that is sliding in shows its windows itself, when they have
+        // got there
+        if transition::is_entering(self.hwnd) {
+            return;
+        }
+
         let mut programmatically_hidden_hwnds = HIDDEN_HWNDS.lock();
         if let Some(idx) = programmatically_hidden_hwnds
             .iter()
@@ -527,7 +539,10 @@ impl Window {
             HidingBehaviour::Hide | HidingBehaviour::Minimize => {
                 WindowsApi::restore_window(self.hwnd);
             }
-            HidingBehaviour::Cloak => SetCloak(self.hwnd(), 1, 0),
+            HidingBehaviour::Cloak => {
+                SetCloak(self.hwnd(), 1, 0);
+                cloaked::record(&programmatically_hidden_hwnds);
+            }
         }
         if restore_border {
             border_manager::show_border(self.hwnd);
@@ -574,6 +589,13 @@ impl Window {
     }
 
     pub fn focus(self, mouse_follows_focus: bool) -> eyre::Result<()> {
+        // Focusing a window that is hidden shows it, which is not for it to be
+        // when it is yet to slide in: it is focused when its animation shows it
+        if transition::is_entering(self.hwnd) {
+            transition::focus_when_shown(self.hwnd, mouse_follows_focus);
+            return Ok(());
+        }
+
         // If the target window is already focused, do nothing.
         if let Ok(ihwnd) = WindowsApi::foreground_window()
             && ihwnd == self.hwnd

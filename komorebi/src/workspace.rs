@@ -11,6 +11,7 @@ use crate::DATA_DIR;
 use crate::DEFAULT_CONTAINER_PADDING;
 use crate::DEFAULT_WORKSPACE_PADDING;
 use crate::FloatingLayerBehaviour;
+use crate::HIDDEN_HWNDS;
 use crate::INITIAL_CONFIGURATION_LOADED;
 use crate::KomorebiTheme;
 use crate::NO_TITLEBAR;
@@ -19,20 +20,27 @@ use crate::REMOVE_TITLEBARS;
 use crate::SocketMessage;
 use crate::Wallpaper;
 use crate::WindowContainerBehaviour;
+use crate::animation::engine::AnimationBatch;
 use crate::border_manager;
 use crate::container::Container;
 use crate::core::Axis;
 use crate::core::CustomLayout;
 use crate::core::CycleDirection;
 use crate::core::DefaultLayout;
+use crate::core::InitialWindowPlacementRules;
 use crate::core::Layout;
 use crate::core::LayoutDefaultEntry;
 use crate::core::LayoutOptions;
 use crate::core::OperationDirection;
+use crate::core::PlacementMatchingRules;
+use crate::core::PlacementTarget;
 use crate::core::Rect;
+use crate::core::WindowKind;
+use crate::core::WindowPlacement;
 use crate::lockable_sequence::LockableSequence;
 use crate::ring::Ring;
 use crate::should_act;
+use crate::should_act_individual;
 use crate::stackbar_manager;
 use crate::stackbar_manager::STACKBAR_TAB_HEIGHT;
 use crate::static_config::WorkspaceConfig;
@@ -41,6 +49,7 @@ use crate::window::WindowDetails;
 use crate::windows_api::WindowsApi;
 use color_eyre::eyre;
 use color_eyre::eyre::OptionExt;
+use komorebi_scrolling::ScrollingSpace;
 use komorebi_themes::Base16ColourPalette;
 use komorebi_themes::KomorebiThemeCustom as Custom;
 use serde::Deserialize;
@@ -94,6 +103,13 @@ pub struct Workspace {
     pub preselected_container_idx: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub promotion_swap_container_idx: Option<usize>,
+    /// Initial window placement rules that determine where new tiled windows are placed
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_window_placement_rules: Option<InitialWindowPlacementRules>,
+    /// The strip of columns that the Scrolling layout lays containers out in
+    #[serde(skip)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    pub(crate) scrolling: Option<ScrollingSpace<String>>,
 }
 
 #[derive(Debug, Default, Copy, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -150,6 +166,8 @@ impl Default for Workspace {
             wallpaper: None,
             preselected_container_idx: None,
             promotion_swap_container_idx: None,
+            initial_window_placement_rules: None,
+            scrolling: None,
         }
     }
 }
@@ -307,6 +325,7 @@ impl Workspace {
 
         // Load layout options directly (LayoutOptions is used in both config and runtime)
         self.layout_options = config.layout_options;
+        self.initial_window_placement_rules = config.initial_window_placement_rules.clone();
 
         // Load threshold-based layout options rules, sorted by threshold ascending
         self.layout_options_rules =
@@ -354,7 +373,7 @@ impl Workspace {
     ///   1. Try threshold match from rules (highest matching threshold wins)
     ///   2. If a rule matches -> use it (full replacement of base)
     ///   3. Else -> use the base `layout_options`
-    fn effective_layout_options(&self) -> Option<LayoutOptions> {
+    pub(crate) fn effective_layout_options(&self) -> Option<LayoutOptions> {
         let container_count = self.containers().len();
 
         let has_workspace_overrides =
@@ -587,6 +606,9 @@ impl Workspace {
             return Ok(());
         }
 
+        // every window that moves in this pass is animated together
+        let _animations = AnimationBatch::begin();
+
         // make sure we are never holding on to empty containers
         self.containers_mut()
             .retain(|c| c.is_preselect() || !c.windows().is_empty());
@@ -696,82 +718,148 @@ impl Workspace {
             } else if let Some(window) = &mut self.maximized_window {
                 window.maximize();
             } else if !self.containers().is_empty() {
-                let effective_layout_options = self.effective_layout_options();
-
-                tracing::debug!(
-                    "Workspace '{}' update() - effective_layout_options: {:?} (base: {:?}, rules: {})",
-                    self.name.as_deref().unwrap_or("unnamed"),
-                    effective_layout_options,
-                    self.layout_options,
-                    self.layout_options_rules.len(),
-                );
-                let mut layouts = self.layout.as_boxed_arrangement().calculate(
-                    &adjusted_work_area,
-                    NonZeroUsize::new(self.containers().len()).ok_or_eyre(
-                        "there must be at least one container to calculate a workspace layout",
-                    )?,
-                    Some(container_padding),
-                    self.layout_flip,
-                    &self.resize_dimensions,
-                    self.focused_container_idx(),
-                    effective_layout_options,
-                    &self.latest_layout,
-                );
-
-                let should_remove_titlebars = REMOVE_TITLEBARS.load(Ordering::SeqCst);
-                let no_titlebar = NO_TITLEBAR.lock().clone();
-                let regex_identifiers = REGEX_IDENTIFIERS.lock().clone();
-
-                let containers = self.containers_mut();
-
-                for (i, container) in containers.iter_mut().enumerate() {
-                    let window_count = container.windows().len();
-
-                    if let Some(layout) = layouts.get_mut(i) {
-                        layout.add_padding(border_offset);
-                        layout.add_padding(border_width);
-
-                        if stackbar_manager::should_have_stackbar(window_count) {
-                            let tab_height = STACKBAR_TAB_HEIGHT.load(Ordering::SeqCst);
-                            let total_height = tab_height + container_padding;
-
-                            layout.top += total_height;
-                            layout.bottom -= total_height;
-                        }
-
-                        for window in container.windows() {
-                            if container
-                                .focused_window()
-                                .is_some_and(|w| w.hwnd == window.hwnd)
-                            {
-                                let should_remove_titlebar_for_window = should_act(
-                                    &window.title().unwrap_or_default(),
-                                    &window.exe().unwrap_or_default(),
-                                    &window.class().unwrap_or_default(),
-                                    &window.path().unwrap_or_default(),
-                                    &no_titlebar,
-                                    &regex_identifiers,
-                                )
-                                .is_some();
-
-                                if should_remove_titlebars && should_remove_titlebar_for_window {
-                                    window.remove_title_bar()?;
-                                } else if should_remove_titlebar_for_window {
-                                    window.add_title_bar()?;
-                                }
-
-                                // If a window has been unmaximized via toggle-maximize, this block
-                                // will make sure that it is unmaximized via restore_window
-                                if window.is_maximized() && !managed_maximized_window {
-                                    WindowsApi::restore_window(window.hwnd);
-                                }
-                            }
-                            window.set_position(layout, false)?;
-                        }
-                    }
+                // windows that were not what they were told to be since the last layout, which
+                // is something that animations only show once they are done
+                let around_window = container_padding + border_offset + border_width;
+                // neighbours of a window that is dragged are not yet the size they are being
+                // made while it is followed: that is not what their columns are to be
+                if self.is_scrolling()
+                    && crate::scrolling::animations_enabled()
+                    && !crate::live_resize::is_stepping()
+                {
+                    self.adopt_actual_widths(around_window, adjusted_work_area.right);
                 }
 
-                self.latest_layout = layouts;
+                let mut pass = 0;
+                loop {
+                    let effective_layout_options = self.effective_layout_options();
+
+                    tracing::debug!(
+                        "Workspace '{}' update() - effective_layout_options: {:?} (base: {:?}, rules: {})",
+                        self.name.as_deref().unwrap_or("unnamed"),
+                        effective_layout_options,
+                        self.layout_options,
+                        self.layout_options_rules.len(),
+                    );
+                    let mut hidden = vec![];
+                    let mut layouts = if self.is_scrolling() {
+                        let others = crate::scrolling::other_monitors(
+                            &self.globals.work_area,
+                            &WindowsApi::monitor_rects(),
+                        );
+
+                        self.layout_scrolling(&adjusted_work_area, container_padding)
+                            .into_iter()
+                            .map(|placement| {
+                                let (rect, hide) = crate::scrolling::rest(
+                                    placement.rect,
+                                    placement.visibility,
+                                    &adjusted_work_area,
+                                    &others,
+                                );
+                                hidden.push(hide);
+                                rect
+                            })
+                            .collect()
+                    } else {
+                        self.layout.as_boxed_arrangement().calculate(
+                            &adjusted_work_area,
+                            NonZeroUsize::new(self.containers().len()).ok_or_eyre(
+                                "there must be at least one container to calculate a workspace layout",
+                            )?,
+                            Some(container_padding),
+                            self.layout_flip,
+                            &self.resize_dimensions,
+                            self.focused_container_idx(),
+                            effective_layout_options,
+                            &self.latest_layout,
+                        )
+                    };
+
+                    let should_remove_titlebars = REMOVE_TITLEBARS.load(Ordering::SeqCst);
+                    let no_titlebar = NO_TITLEBAR.lock().clone();
+                    let regex_identifiers = REGEX_IDENTIFIERS.lock().clone();
+
+                    let containers = self.containers_mut();
+
+                    for (i, container) in containers.iter_mut().enumerate() {
+                        let window_count = container.windows().len();
+
+                        if let Some(layout) = layouts.get_mut(i) {
+                            layout.add_padding(border_offset);
+                            layout.add_padding(border_width);
+
+                            if stackbar_manager::should_have_stackbar(window_count) {
+                                let tab_height = STACKBAR_TAB_HEIGHT.load(Ordering::SeqCst);
+                                let total_height = tab_height + container_padding;
+
+                                layout.top += total_height;
+                                layout.bottom -= total_height;
+                            }
+
+                            for window in container.windows() {
+                                if container
+                                    .focused_window()
+                                    .is_some_and(|w| w.hwnd == window.hwnd)
+                                {
+                                    let should_remove_titlebar_for_window = should_act(
+                                        &window.title().unwrap_or_default(),
+                                        &window.exe().unwrap_or_default(),
+                                        &window.class().unwrap_or_default(),
+                                        &window.path().unwrap_or_default(),
+                                        &no_titlebar,
+                                        &regex_identifiers,
+                                    )
+                                    .is_some();
+
+                                    if should_remove_titlebars && should_remove_titlebar_for_window
+                                    {
+                                        window.remove_title_bar()?;
+                                    } else if should_remove_titlebar_for_window {
+                                        window.add_title_bar()?;
+                                    }
+
+                                    // If a window has been unmaximized via toggle-maximize, this block
+                                    // will make sure that it is unmaximized via restore_window
+                                    if window.is_maximized() && !managed_maximized_window {
+                                        WindowsApi::restore_window(window.hwnd);
+                                    }
+                                }
+                                if hidden.get(i).copied().unwrap_or_default() {
+                                    // it is seen on another monitor wherever it rests here
+                                    window.hide();
+                                } else {
+                                    if crate::scrolling::should_restore_when_placed(
+                                        window.hwnd,
+                                        container.focused_window().map(|w| w.hwnd),
+                                        &HIDDEN_HWNDS.lock(),
+                                    ) {
+                                        window.restore();
+                                    }
+
+                                    window.set_position(layout, false)?;
+                                }
+                            }
+                        }
+                    }
+
+                    self.latest_layout = layouts;
+
+                    // with animations off every window that changed width has been asked what it
+                    // is by now, so a window that refused is known, and everything after it is
+                    // placed again with room for it. Once is enough: a layout is never made to
+                    // chase the sizes that are read back this time round.
+                    if pass == 0
+                        && self.is_scrolling()
+                        && !crate::scrolling::animations_enabled()
+                        && self.adopt_actual_widths(around_window, adjusted_work_area.right)
+                    {
+                        pass += 1;
+                        continue;
+                    }
+
+                    break;
+                }
             }
         }
 
@@ -1041,6 +1129,9 @@ impl Workspace {
     // this fn respects locked container indexes - we should use it for pretty much everything
     // except monocle and maximize toggles
     pub fn remove_container_by_idx(&mut self, idx: usize) -> Option<Container> {
+        // wherever it goes next, it goes as wide as it was
+        self.note_scrolling_departure(idx);
+
         let container = self.containers_mut().remove_respecting_locks(idx);
 
         if idx < self.resize_dimensions.len() {
@@ -1120,8 +1211,12 @@ impl Workspace {
             .ok_or_eyre("there is no window")?;
 
         if container.windows().is_empty() {
+            let container_id = container.id.clone();
             self.remove_container_by_idx(container_idx);
-            self.focus_previous_container();
+
+            if !self.focus_after_scrolling_removal(&container_id) {
+                self.focus_previous_container();
+            }
         } else {
             container.load_focused_window();
             if let Some(window) = container.focused_window() {
@@ -1160,6 +1255,12 @@ impl Workspace {
     }
 
     pub fn new_idx_for_direction(&self, direction: OperationDirection) -> Option<usize> {
+        // in a strip, left and right are the neighbouring columns and up and down are the tiles of
+        // the column, which the strip is the one to say
+        if self.is_scrolling() && self.scrolling.is_some() {
+            return self.scrolling_idx_for_direction(direction);
+        }
+
         let len = NonZeroUsize::new(self.containers().len())?;
 
         direction.destination(
@@ -1265,14 +1366,128 @@ impl Workspace {
             next
         } else if self.containers().is_empty() {
             0
+        } else if let Some(idx) = self.scrolling_insertion_idx() {
+            idx
         } else {
-            self.focused_container_idx() + 1
+            self.resolve_placement_index(&window)
         };
 
         let mut container = Container::default();
         container.add_window(window);
 
         self.insert_container_at_idx(next_idx, container);
+    }
+
+    /// Resolves the container index at which a new window should be placed,
+    /// based on the `initial_window_placement_rules` configuration.
+    ///
+    /// Falls back to the default placement (currently `AfterFocused`,
+    /// i.e. `focused_container_idx() + 1`) when:
+    /// - No rules are configured
+    /// - A `Rules` map has no matching rule for the window
+    /// - A resolved index is out of bounds
+    fn resolve_placement_index(&self, window: &Window) -> usize {
+        let fallback_idx = self.focused_container_idx() + 1;
+
+        let Some(rules) = &self.initial_window_placement_rules else {
+            return fallback_idx;
+        };
+
+        match rules {
+            InitialWindowPlacementRules::Target(target) => {
+                self.resolve_placement_target(target, fallback_idx)
+            }
+            InitialWindowPlacementRules::Rules(rules_map) => {
+                let Ok(title) = window.title() else {
+                    return fallback_idx;
+                };
+                let Ok(exe_name) = window.exe() else {
+                    return fallback_idx;
+                };
+                let Ok(class) = window.class() else {
+                    return fallback_idx;
+                };
+                let Ok(path) = window.path() else {
+                    return fallback_idx;
+                };
+
+                let regex_identifiers = REGEX_IDENTIFIERS.lock().clone();
+
+                // BTreeMap iterates in key order
+                for (target, placement_rules) in rules_map {
+                    let matched = match placement_rules {
+                        PlacementMatchingRules::Single(id) => should_act_individual(
+                            &title,
+                            &exe_name,
+                            &class,
+                            &path,
+                            id,
+                            &regex_identifiers,
+                        ),
+                        PlacementMatchingRules::Many(rules) => {
+                            // OR logic: any matching rule triggers placement at this target.
+                            // Each MatchingRule handles its own Simple/Composite (AND) logic
+                            // internally via should_act.
+                            should_act(&title, &exe_name, &class, &path, rules, &regex_identifiers)
+                                .is_some()
+                        }
+                    };
+
+                    if matched {
+                        return self.resolve_placement_target(target, fallback_idx);
+                    }
+                }
+
+                // No matching rule found
+                fallback_idx
+            }
+        }
+    }
+
+    /// Resolves a `WindowPlacement` variant to a concrete container index.
+    fn resolve_window_placement(&self, placement: &WindowPlacement, fallback_idx: usize) -> usize {
+        match placement {
+            WindowPlacement::AfterFocused => self.focused_container_idx() + 1,
+            WindowPlacement::BeforeFocused => self.focused_container_idx(),
+            WindowPlacement::Primary => {
+                let idx = self.layout.primary_index();
+                if idx <= self.containers().len() {
+                    idx
+                } else {
+                    fallback_idx
+                }
+            }
+            WindowPlacement::Secondary => {
+                if let Some(idx) = self.layout.secondary_index(self.containers().len()) {
+                    if idx <= self.containers().len() {
+                        idx
+                    } else {
+                        fallback_idx
+                    }
+                } else {
+                    fallback_idx
+                }
+            }
+            WindowPlacement::Last => self.containers().len(),
+        }
+    }
+
+    /// Resolves a `PlacementTarget` (either a named placement or a 1-based index) to a concrete container index.
+    fn resolve_placement_target(&self, target: &PlacementTarget, fallback_idx: usize) -> usize {
+        match target {
+            PlacementTarget::Placement(placement) => {
+                self.resolve_window_placement(placement, fallback_idx)
+            }
+            PlacementTarget::Index(idx) => {
+                // Config indices are 1-based; convert to 0-based
+                let zero_based = idx.saturating_sub(1);
+                if zero_based <= self.containers().len() {
+                    zero_based
+                } else {
+                    fallback_idx
+                }
+            }
+        }
     }
 
     pub fn new_floating_window(&mut self) -> eyre::Result<()> {
@@ -1339,9 +1554,6 @@ impl Workspace {
             }
             Layout::Default(DefaultLayout::UltrawideVerticalStack) => {
                 self.enforce_resize_for_ultrawide();
-            }
-            Layout::Default(DefaultLayout::Scrolling) => {
-                self.enforce_resize_for_scrolling();
             }
             _ => self.enforce_no_resize(),
         }
@@ -1570,28 +1782,6 @@ impl Workspace {
         }
     }
 
-    fn enforce_resize_for_scrolling(&mut self) {
-        let resize_dimensions = &mut self.resize_dimensions;
-        match resize_dimensions.len() {
-            0 | 1 => self.enforce_no_resize(),
-            _ => {
-                let len = resize_dimensions.len();
-
-                for (i, rect) in resize_dimensions.iter_mut().enumerate() {
-                    if let Some(rect) = rect {
-                        rect.top = 0;
-                        rect.bottom = 0;
-
-                        if i == 0 {
-                            rect.left = 0;
-                        } else if i == len - 1 {
-                            rect.right = 0;
-                        }
-                    }
-                }
-            }
-        }
-    }
     fn enforce_no_resize(&mut self) {
         for rect in self.resize_dimensions.iter_mut().flatten() {
             rect.left = 0;
@@ -1655,6 +1845,23 @@ impl Workspace {
 
         self.monocle_container = None;
         self.monocle_container_restore_idx = None;
+
+        Ok(())
+    }
+
+    pub fn cycle_monocle_container(&mut self, direction: CycleDirection) -> eyre::Result<()> {
+        if self.containers().is_empty() {
+            return Ok(());
+        }
+
+        self.reintegrate_monocle_container()?;
+
+        let new_idx = self
+            .new_idx_for_cycle_direction(direction)
+            .ok_or_eyre("there is no container to cycle monocle to")?;
+
+        self.focus_container(new_idx);
+        self.new_monocle_container()?;
 
         Ok(())
     }
@@ -1816,6 +2023,60 @@ impl Workspace {
         }
 
         vec
+    }
+
+    /// The windows that are on show, which are the ones to slide when the
+    /// workspace is switched
+    pub fn windows_on_show(&self) -> Vec<Window> {
+        if let Some(monocle) = &self.monocle_container {
+            return monocle.focused_window().copied().into_iter().collect();
+        }
+
+        self.visible_windows()
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect()
+    }
+
+    /// What kind of border each of the windows that are on show has
+    pub fn border_kinds_on_show(&self) -> Vec<(isize, WindowKind)> {
+        if let Some(monocle) = &self.monocle_container {
+            return monocle
+                .focused_window()
+                .map(|window| (window.hwnd, WindowKind::Monocle))
+                .into_iter()
+                .collect();
+        }
+
+        let mut kinds: Vec<(isize, WindowKind)> = self
+            .containers()
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, container)| {
+                let kind = if idx != self.focused_container_idx() {
+                    if container.locked {
+                        WindowKind::UnfocusedLocked
+                    } else {
+                        WindowKind::Unfocused
+                    }
+                } else if container.windows().len() > 1 {
+                    WindowKind::Stack
+                } else {
+                    WindowKind::Single
+                };
+
+                container.focused_window().map(|window| (window.hwnd, kind))
+            })
+            .collect();
+
+        kinds.extend(
+            self.floating_windows()
+                .iter()
+                .map(|window| (window.hwnd, WindowKind::Unfocused)),
+        );
+
+        kinds
     }
 
     pub fn visible_window_details(&self) -> Vec<WindowDetails> {
